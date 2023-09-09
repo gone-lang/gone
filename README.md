@@ -4,9 +4,8 @@
 
 有了它你可以写如下代码, 代码更加紧凑 阅读更轻松
 
-转换前:
-
 ```go
+// main.gone
 package main
 
 import (
@@ -28,9 +27,14 @@ func readSelf() (content string, err error) {
 
 ```
 
-转换后:
+如果你喜欢这个想法, 请为这个项目添加一颗 Star , 每颗 Star 都是在表达你的喜爱
+
+越多人喜爱, 就越有可能被尽快实现
+
+转译后的代码如下:
 
 ```go
+// main.go
 package main
 
 import (
