@@ -1,0 +1,19 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func parse(s string) (int, error) { return 0, errors.New("bad " + s) }
+
+func load() (n int, err error) {
+	x, !err := parse("input")
+	n = x
+	return
+}
+
+func main() {
+	n, err := load()
+	fmt.Println(n, err)
+}

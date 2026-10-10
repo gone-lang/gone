@@ -1,0 +1,1 @@
+main.go:6:8: syntax error: !err sugar is not allowed in if statement header

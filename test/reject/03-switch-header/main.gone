@@ -1,0 +1,10 @@
+package main
+
+func f() (int, error) { return 0, nil }
+
+func main() {
+	switch x, !err := f(); x {
+	case 0:
+		_ = err
+	}
+}

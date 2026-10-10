@@ -1,0 +1,18 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var boom = errors.New("boom")
+
+func first() (int, error)  { return 1, nil }
+func second() (int, error) { return 2, boom }
+
+func main() {
+	a, !err := first()
+	fmt.Println("a =", a)
+	b, !err2 := second()
+	fmt.Println("never", b, err2)
+}

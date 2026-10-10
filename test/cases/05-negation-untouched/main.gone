@@ -1,0 +1,14 @@
+package main
+
+import "fmt"
+
+func main() {
+	ok := false
+	if !ok {
+		fmt.Println("negation ok")
+	}
+	for !ok {
+		break
+	}
+	fmt.Println(!ok)
+}

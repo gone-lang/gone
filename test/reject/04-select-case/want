@@ -1,0 +1,1 @@
+main.go:6:10: syntax error: !err sugar is not allowed in select case

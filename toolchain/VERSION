@@ -1,0 +1,6 @@
+# gone 工具链跟随的上游 Go 版本。补丁是针对这个版本的源码生成的。
+# 换版本(或升级到新的 patch release)后需要重新验证 toolchain/*.patch 是否能干净应用。
+GONE_GO_VERSION=go1.27.2
+GONE_GO_SRC=go1.27.2.src.tar.gz
+GONE_GO_SRC_URL=https://dl.google.com/go/go1.27.2.src.tar.gz
+GONE_GO_SRC_SHA256=03495da2ba64894d40f5c4992e49454fa78b50690604ff92b6afff5081b76e62

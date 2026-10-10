@@ -31,7 +31,7 @@ func readSelf() (content string, err error) {
 
 越多人喜爱, 就越有可能被尽快实现
 
-转译后的代码如下:
+编译器会把它展开成等价的普通 Go 代码:
 
 ```go
 // main.go
@@ -66,4 +66,63 @@ func readSelf() (content string, err error) {
 
 1. 因为官方不接受这个语法糖 https://github.com/golang/go/issues/62253
 2. [代码生成](https://github.com/shynome/err4)有弊端, 断点调试只能在生成后的文件打
-3. golang 语言简单, 为其添加这么一个功能应该不算太难, 零基础大概一两个月也能搞定, 所以我来试试(但不是现在,实现应该是在 11 月之后)
+3. golang 语言简单, 为其添加这么一个功能应该不算太难, 零基础大概一两个月也能搞定, 所以我来试试
+
+于是就去 fork 了 Go 工具链, 在 `cmd/compile` 的前端解析器里把它做成了真正的语法糖。
+
+## 实现状态
+
+已经可以用了。语法糖在 `cmd/compile/internal/syntax`(解析器) 层脱糖, 类型检查器/IR/SSA/链接器一行都不用改,
+所以内联、逃逸分析、`-race`、调试信息全都是普通 Go 代码的水平。
+
+```bash
+# 完整构建: 下载官方 go1.27.2 源码(校验 sha256) → 打补丁 → make.bash 自举(约 1~2 分钟)
+scripts/build-toolchain.sh
+
+# 或者快速迭代: 复制本机 GOROOT → 打补丁 → 只重建 cmd/compile(约 3 秒)
+scripts/build-toolchain.sh --fast --out ./gone-go --force
+
+# 跑测试套件
+scripts/test.sh --toolchain ./gone-go
+
+# 使用
+export GOROOT="$PWD/gone-go"
+export PATH="$GOROOT/bin:$PATH"
+go build ./...
+```
+
+详细设计见 [design.md](./design.md)。
+
+### 亮点
+
+- **与 Go 完全兼容**: 合法 Go 程序里, 一元 `!` 表达式永远不会出现在赋值左值上,
+  所以语法糖只是把一个"原本非法的位置"赋予了新含义, 不会改变任何现有程序的行为。
+- **调试信息正确**: 不插入源码行, 合成节点的位置就是 `!` 所在位置, 行号与源码逐行对应,
+  断点直接打在源码上(这正是 [err4](https://github.com/shynome/err4) 这类代码生成的短板)。
+
+### 语法
+
+```go
+x, !err := f()            // x, err := f(); if err != nil { return }
+x, !e1, !e2 := f()        // if e1 != nil || e2 != nil { return }
+var x int
+x, !err = f()             // 普通赋值同样支持
+```
+
+`!err` 只能用在语句列表里直接出现的赋值语句上; 放在 if/for/switch 的 init/post 或 `select`
+的 comm 子句里会明确报错(`!err sugar is not allowed in ...`), 因为这些位置没地方插入错误检查。
+
+### 当前限制
+
+1. 裸 `return` 要求函数结果是具名的(或函数没有结果), 例如要写成
+   `func f() (s string, err error)`; 结果未具名时会编译报错。
+2. `.gone` 扩展名暂时还不被 `go build` 识别, 需要先改名成 `.go`(见下一条路线图)。
+3. gopls / `go vet` 走的 `go/parser` + `go/types` 还没适配(所以 IDE 里会有红线),
+   但 `gofmt` 已经能正常处理。
+
+### 路线图
+
+- [x] **M1** 解析器脱糖 `!err`, 重建工具链并验证
+- [ ] **M2** `go/build` + 模块扫描识别 `.gone` 扩展名, `go build ./...` 直接吃 `.gone`
+- [ ] **M3** `go/parser` + `go/types` 支持, 让 gopls / `go vet` / `goimports` 认识 `!err`
+- [ ] **M4** 结果未具名时自动 `return zero..., err`; 错误信息打磨

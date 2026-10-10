@@ -1,0 +1,22 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var boom = errors.New("boom")
+
+func src() (int, error) { return 5, boom }
+
+func load() (n int, err error) {
+	var x int
+	x, !err = src()
+	n = x
+	return
+}
+
+func main() {
+	n, err := load()
+	fmt.Println(n, err)
+}

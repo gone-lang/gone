@@ -1,0 +1,191 @@
+diff --git a/patched/src/cmd/compile/internal/syntax/errsugar.go b/src/cmd/compile/internal/syntax/errsugar.go
+new file mode 100644
+index 0000000..da5a48c
+--- /dev/null
++++ b/src/cmd/compile/internal/syntax/errsugar.go
+@@ -0,0 +1,147 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package syntax
++
++import "fmt"
++
++// The !err error-handling sugar.
++//
++// An assignment of the form
++//
++//	x, !err := f()
++//
++// is shorthand for
++//
++//	x, err := f()
++//	if err != nil {
++//		return
++//	}
++//
++// The '!' marker must immediately precede the name of an error variable on the
++// left-hand side of an assignment. A unary '!' operand is never a valid
++// assignment target in Go, so the sugar cannot change the meaning of any
++// existing valid Go program.
++//
++// The sugar is only accepted for assignments that are direct elements of a
++// statement list (a block or case clause body), because the implicit error
++// check has to be inserted right after the assignment. Using it in the init or
++// post part of an if/for/switch statement, or in a select comm clause, is
++// reported as an error.
++
++// errSugarOp reports the unary '!' operation and its operand name if x is a
++// candidate for the !err sugar, i.e. x has the form '!name'. Otherwise both
++// results are nil.
++func errSugarOp(x Expr) (*Operation, *Name) {
++	op, ok := x.(*Operation)
++	if !ok || op.Op != Not || op.Y != nil {
++		return nil, nil
++	}
++	name, ok := op.X.(*Name)
++	if !ok {
++		return nil, nil
++	}
++	return op, name
++}
++
++// takeErrSugar removes the '!' markers from the left-hand side of the
++// assignment as. It returns the marked names and the position of the first
++// marker, which is used as the position of the synthesized error check. If as
++// does not use the sugar, names is empty and pos is unknown.
++func takeErrSugar(as *AssignStmt) (names []*Name, pos Pos) {
++	if as.Op != Def && as.Op != 0 {
++		// not a plain '=' or ':=' assignment
++		return nil, pos
++	}
++	take := func(x Expr) Expr {
++		op, name := errSugarOp(x)
++		if op == nil {
++			return x
++		}
++		if !pos.IsKnown() {
++			pos = op.Pos()
++		}
++		names = append(names, name)
++		return name
++	}
++	if lhs, ok := as.Lhs.(*ListExpr); ok {
++		for i, x := range lhs.ElemList {
++			lhs.ElemList[i] = take(x)
++		}
++	} else {
++		as.Lhs = take(as.Lhs)
++	}
++	return names, pos
++}
++
++// rejectErrSugar reports an error for every '!' marker on the left-hand side of
++// as. It is used in contexts where the implicit error check cannot be inserted.
++func (p *parser) rejectErrSugar(as *AssignStmt, context string) {
++	if as.Op != Def && as.Op != 0 {
++		return
++	}
++	reject := func(x Expr) {
++		if op, _ := errSugarOp(x); op != nil {
++			p.syntaxErrorAt(op.Pos(), fmt.Sprintf("!err sugar is not allowed in %s", context))
++		}
++	}
++	if lhs, ok := as.Lhs.(*ListExpr); ok {
++		for _, x := range lhs.ElemList {
++			reject(x)
++		}
++	} else {
++		reject(as.Lhs)
++	}
++}
++
++// newErrCheck returns the implicit error check
++//
++//	if err1 != nil || err2 != nil {
++//		return
++//	}
++//
++// for the given error variables. The same name is checked only once. All
++// synthesized nodes are given position pos, the position of the first '!'
++// marker, so that the error check maps back to the line of the assignment.
++func newErrCheck(names []*Name, pos Pos) Stmt {
++	seen := make(map[string]bool, len(names))
++	var cond Expr
++	for _, name := range names {
++		if seen[name.Value] {
++			continue
++		}
++		seen[name.Value] = true
++		c := &Operation{Op: Neq, X: name, Y: NewName(pos, "nil")}
++		c.pos = pos
++		if cond == nil {
++			cond = c
++			continue
++		}
++		or := &Operation{Op: OrOr, X: cond, Y: c}
++		or.pos = pos
++		cond = or
++	}
++	ret := &ReturnStmt{}
++	ret.pos = pos
++	then := &BlockStmt{List: []Stmt{ret}, Rbrace: pos}
++	then.pos = pos
++	check := &IfStmt{Cond: cond, Then: then}
++	check.pos = pos
++	return check
++}
++
++// desugarErrAssign appends s to list and, if s is an assignment using the !err
++// sugar, also appends the implicit error check.
++func (p *parser) desugarErrAssign(list []Stmt, s Stmt) []Stmt {
++	as, ok := s.(*AssignStmt)
++	if !ok {
++		return append(list, s)
++	}
++	names, pos := takeErrSugar(as)
++	list = append(list, s)
++	if len(names) == 0 {
++		return list
++	}
++	return append(list, newErrCheck(names, pos))
++}
+diff --git a/src/cmd/compile/internal/syntax/parser.go b/src/cmd/compile/internal/syntax/parser.go
+index f1f15c6..b9c6065 100644
+--- a/src/cmd/compile/internal/syntax/parser.go
++++ b/src/cmd/compile/internal/syntax/parser.go
+@@ -2228,7 +2228,13 @@ func (p *parser) simpleStmt(lhs Expr, keyword token) SimpleStmt {
+ 			}
+ 		}
+ 
+-		return p.newAssignStmt(pos, op, lhs, rhs)
++		s := p.newAssignStmt(pos, op, lhs, rhs)
++		if keyword != 0 {
++			// The !err sugar expands to an assignment plus an implicit
++			// error check and therefore needs a statement list to live in.
++			p.rejectErrSugar(s, keyword.String()+" statement header")
++		}
++		return s
+ 
+ 	default:
+ 		p.syntaxError("expected := or = or comma")
+@@ -2574,6 +2580,9 @@ func (p *parser) commClause() *CommClause {
+ 	case _Case:
+ 		p.next()
+ 		c.Comm = p.simpleStmt(nil, 0)
++		if as, ok := c.Comm.(*AssignStmt); ok {
++			p.rejectErrSugar(as, "select case")
++		}
+ 
+ 		// The syntax restricts the possible simple statements here to:
+ 		//
+@@ -2721,7 +2730,7 @@ func (p *parser) stmtList() (l []Stmt) {
+ 		if s == nil {
+ 			break
+ 		}
+-		l = append(l, s)
++		l = p.desugarErrAssign(l, s)
+ 		// ";" is optional before "}"
+ 		if !p.got(_Semi) && p.tok != _Rbrace {
+ 			p.syntaxError("at end of statement")

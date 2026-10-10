@@ -1,0 +1,1 @@
+main.go:6:9: syntax error: !err sugar is not allowed in for statement header

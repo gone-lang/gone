@@ -1,0 +1,16 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+var e2 = errors.New("e2")
+
+func two() (int, error, error) { return 7, nil, e2 }
+
+func main() {
+	fmt.Println("before")
+	a, !e1, !e2 := two()
+	fmt.Println("after", a, e1, e2)
+}

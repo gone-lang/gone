@@ -1,0 +1,9 @@
+package main
+
+func f() (int, error) { return 0, nil }
+
+func main() {
+	if x, !err := f(); x > 0 {
+		_ = err
+	}
+}
