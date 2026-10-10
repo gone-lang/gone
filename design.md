@@ -112,7 +112,7 @@ if e1 != nil || e2 != nil {
 
 选 fork 工具链：它是唯一能同时满足「真编译器」「调试信息正确」「原生 `go build`」的路。
 
-### 3.2 补丁点：`cmd/compile/internal/syntax` 解析器脱糖
+### 3.2 补丁点 1：`cmd/compile/internal/syntax` 解析器脱糖（编译器侧）
 
 关键在于**在前端最早的一层脱糖**，让类型检查器（types2）和 IR 生成（noder）完全看不到 `!err`：
 
@@ -134,6 +134,8 @@ if e1 != nil || e2 != nil {
 |---|---|
 | `src/cmd/compile/internal/syntax/errsugar.go` | 新增。识别 `!name`、剥掉 `!`、构造隐式 `if` 语句 |
 | `src/cmd/compile/internal/syntax/parser.go` | 3 处钩子：`stmtList` 里脱糖；`simpleStmt`（header 上下文）与 `commClause` 里报错 |
+
+（工具链生态侧的第二个补丁见 §3.5。）
 
 AST 层面就是拼现成节点，没有任何新节点类型：
 
@@ -175,6 +177,55 @@ $ go build -gcflags=-S .
 
 第 9 行正是 `body, !err := readSelf()`。`dlv` / gdb 在这行下断点即可停在错误检查上。
 
+### 3.5 补丁点 2：`go/types`（让 `go vet` / gopls 也认识语法糖）
+
+编译器改好之后，编辑器和 `go vet` 依然会把语法糖当错误，因为它们走的是标准库
+`go/parser` + `go/types`，而不是 `cmd/compile`。
+
+实测结论：**只需要改 `go/types`**。
+
+- `go/parser` 本来就接受 `x, !err := f()`：`!err` 就是一个普通的 `*ast.UnaryExpr`，
+  报错要到类型检查阶段才有（`non-name !err on left side of :=`）；
+- `go/printer` / `go/format`（即 gofmt）打印 `!err` 正常且幂等，
+  所以源码里的语法糖**不会被 gofmt 抹掉**；
+- 因此补丁只落在 `src/go/types`。
+
+| 文件 | 改动 |
+|---|---|
+| `src/go/types/errsugar.go` | 新增。识别并剥离 `!id`、拒绝非法位置、补齐 `Info`（见下） |
+| `src/go/types/stmt.go` | 4 处小改：赋值语句处处理语法糖；`simpleStmt` / `labeledStmt` / select comm 三处拒绝 |
+
+只动这两个文件是有意的：`go/types` 里有一部分文件是由 `cmd/compile/internal/types2`
+**生成**的（见 `generate_test.go` 的 `filemap`），改它们就必须同步改 types2，
+否则 `TestGenerate` 会红。好在 `stmt.go` 不在生成表内、属于 go/types 独有文件，
+所以这次完全不用碰 types2 —— 编译器侧本来也不需要，解析器层已经把糖脱掉了。
+
+与编译器不同，这里**不改写 AST**：同一份 AST 可能被**重复类型检查**（gopls 就会这么做）。
+如果在 AST 里把 `!err` 就地换成 `err`，第二次检查看到的就是一句普通赋值，
+于是开始报 `declared and not used: err`（这个坑实测踩到过，后来专门加了幂等性测试）。
+
+所以做法是：检查时把 `!id` 当成 `id`（改在副本上），同时把 `Info` 补齐，
+维持「AST 里的节点在 `Info` 里都有对应项」这个隐含约定：
+
+- `Info.Uses[err] = 变量` —— 隐式检查确实读取了它；
+- `Info.Types[!err] = {variable, error 类型}` —— 每个表达式节点都有类型；
+- `usedVars[变量] = true` —— 不能被判为「声明但未使用」。
+
+后两条是必需的：`go vet` 的 printf 分析器（`x/tools/refactor/satisfy`）
+既要求左值标识符出现在 `Uses` 里，也要求每个表达式节点在 `Types` 里有类型，否则直接 panic。
+
+「只允许出现在语句列表里」这条规则靠**入口检查**实现，而不是给 `stmt` 加 `inList` 参数
+（那样会连带改动生成表内的 `range.go`）：在 `simpleStmt`（if/for/switch 的 init 与 post）、
+`labeledStmt` 和 select 的 comm 子句三处调用 `rejectErrSugar` —— 它们是仅有的、
+语法糖没有落脚点的入口。报错文本与编译器一致
+（`!err sugar is not allowed here (only as a direct element of a statement list)`），
+位置也一样指向 `!`。
+
+边界：`!_` 不算语法糖，两边一致地报 `cannot use _ as value or type`。
+两个小约定：错误码来自 `internal/types/errors`，新文件要照 go/types 的惯例加
+`. "internal/types/errors"` 点导入；`check.errorf` 按 `TestErrorCalls` 的要求
+至少要带一个格式参数，所以这里用 `check.error`。
+
 ## 4. 限制
 
 1. **裸 `return` 要求函数结果全为具名，或函数没有结果。**
@@ -195,8 +246,10 @@ $ go build -gcflags=-S .
    `.gone` 文件需要改名成 `.go` 才能被 `go build` 处理
    （`go tool compile some.gone` 已经可以，编译器本身不看扩展名）。
 
-3. **IDE（gopls）暂不支持。** gopls 走 `go/parser` + `go/types`，属 M3。
-   目前 `gofmt` 已经能正常处理（原样保留 `!err`），但 `go vet` 会因为 `go/types` 报错。
+3. **gopls 需要用 gone 工具链重装一份。** `go vet` 已经随工具链准备好了，
+   但 gopls 是外部二进制、把 `go/types` 静态链接进去，
+   所以要用 `GOROOT=./gone-go go install golang.org/x/tools/gopls@latest` 重装；
+   现成的官方 gopls 里带的还是原版 `go/types`。
 
 ## 5. 里程碑
 
@@ -204,12 +257,12 @@ $ go build -gcflags=-S .
 |---|---|---|
 | **M1** | `cmd/compile/internal/syntax` 解析器脱糖 `!err`，重建工具链并验证 | ✅ 已完成 |
 | M2 | `go/build` + `go list`/模块扫描识别 `.gone` 扩展名，`go build ./...` 直接吃 `.gone` | 待定 |
-| M3 | `go/parser` + `go/types` 支持，让 gopls / `go vet` / `goimports` 认识 `!err` | 待定 |
+| M3 | `go/types` 支持，让 `go vet` / gopls 认识 `!err`（`go/parser`、`gofmt` 本来就无需改动） | ✅ 已完成 |
+| M4 | 结果未具名时自动 `return zero..., err`（需要类型信息，在 noder/types 层补）；错误信息打磨 | 待定 |
+| M5 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
 
 > M2 落地时要注意 `example/` 目录同时放着 `main.go` 和 `main.gone`
 > （一个是手工展开的等价代码），扩展名一旦被识别就会出现重复声明，需要一起调整。
-| M4 | 结果未具名时自动 `return zero..., err`（需要类型信息，在 noder/types 层补）；错误信息打磨 | 待定 |
-| M5 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
 
 ## 6. 工具链构建与测试
 
@@ -217,7 +270,7 @@ $ go build -gcflags=-S .
 # 完整构建：下载官方 go1.27.2 源码(校验 sha256) → 打补丁 → make.bash 自举
 scripts/build-toolchain.sh
 
-# 快速迭代：复制本机 GOROOT → 打补丁 → 只重建 cmd/compile（约 3 秒）
+# 快速迭代：复制本机 GOROOT → 打补丁 → 只重建 cmd/compile 与 cmd/vet（约 3 秒）
 scripts/build-toolchain.sh --fast --out ./gone-go --force
 
 # 用产物跑测试套件
@@ -232,26 +285,42 @@ go build ./...
 固件版本记录在 `toolchain/VERSION`。补丁是针对该版本源码生成的；
 升级 Go 版本后必须重新验证补丁能否干净应用（用 `patch --dry-run` 或直接跑测试套件）。
 
+注意：补丁改到哪个包，就必须重建哪些**预编译工具**，否则 `go` 命令用的还是旧二进制 ——
+`--fast` 模式因此会重建 `compile`（对应 §3.2）和 `vet`（对应 §3.5）。
+
 测试套件：
 
 - `test/cases/*/` —— 行为用例（成功继续执行 / 错误传播 / 多标记 / 普通赋值 / 取反不受影响 /
   `:=` 重复声明具名结果 / 连续多个糖），比对 stdout。
-- `test/reject/*/` —— 非法位置用例，比对报错文本**含行列号**（确保 `!` 被精确指向）。
+- `test/reject/*/` —— 非法位置用例，比对编译报错文本**含行列号**（确保 `!` 被精确指向）。
+- `test/vet/*/` —— `go vet`（走 `go/types`）用例：合法糖必须干净通过、
+  真 bug 仍要报出来、非法位置要报出 `go/types` 的错误。
+- `test/tools/gotypescheck/` —— 直接用 `go/parser` + `go/types` 类型检查一段固定源码，
+  比对诊断列表（覆盖「声明但未使用」这类需要 `Info` 完整性的场景）。
 
 ## 7. 已验证内容
 
-- `scripts/test.sh`：11/11 通过（go1.27.0 fast 模式 与 go1.27.2 完整自举 两套工具链）。
+- `scripts/test.sh`：15/15 通过，覆盖 4 个套件（`--fast` 与完整自举两套工具链）。
 - 回归：`go test cmd/compile/internal/syntax cmd/compile/internal/types2 cmd/compile/internal/noder` 全绿。
 - 全量：`make.bash` 用改后的编译器等自举了三轮，并编译了整个标准库与全部命令。
 - 自举：用打了补丁的编译器编译 `cmd/compile` 自己，产出的编译器再跑测试套件仍然全绿。
 - 行号：`-gcflags=-S` 确认 nil 检查的代码归属行 == `!err` 所在行。
+- M3 端到端：`go vet` 在语法糖代码上不再 panic 且仍能查出 printf 问题；
+  用 gone 工具链重装的 gopls 对合法糖零诊断、对非法位置报出与编译器同位置的错误。
+- M3 幂等性：同一份 AST 连续类型检查 3 次结果一致（gopls 会重复检查，这点专门验证过）。
 
 ## 8. 风险
 
-- **补丁跟随上游**：Go 每个版本 `cmd/compile/internal/syntax` 都可能微调，
-  升级时需要重新 rebase 补丁（补丁很小，成本可控）。
-- **M3 的 `go/types` 改动比 M1 大**：`go/types` 不能改写 AST，只能在类型检查时
-  把 `!x` 当作 `x` 处理并标记为已使用；同时要保证「声明但未使用」等诊断不误报。
+- **补丁跟随上游**：Go 每个版本 `cmd/compile/internal/syntax` 与 `go/types` 都可能微调，
+  升级时需要重新 rebase 补丁（补丁都很小，成本可控）。
+- **`Info` 完整性是 M3 的隐性契约**：因为不改写 AST（为了可重复检查），
+  `!err` 这个表达式节点会留在 AST 里，必须靠我们补的 `Uses` / `Types` 条目
+  让遍历 AST 的工具满意。目前已知 `go vet`（`satisfy`）与 gopls 依赖这一点；
+  将来若遇到别的工具越界报错，优先沿用「补齐 `Info`」的思路，而不是改写 AST。
+- **`go/types` 与 `types2` 出现分叉**：`types2` 是由 `go/types` 生成的副本
+  （`cmd/compile/internal/types2/generate.sh`）。本补丁只加在 `go/types`：
+  编译器不需要它，因为 `cmd/compile` 在解析器层就已经脱糖了（§3.2）。
+  如果哪天重新生成 `types2`，会顺带带上这段代码，功能上无害（编译器永远看不到 `!err`）。
 - **生态意外**：语法糖在**所有** `.go` 文件里都生效（不只是 `.gone`）。
   考虑到 §2.3 的完全向后兼容性，这不会改变任何现有程序的语义；
   但确实会让「写错的文件」报出不同的错误信息。若将来需要收敛，

@@ -1,0 +1,1 @@
+main.go:6:10: !err sugar is not allowed here (only as a direct element of a statement list)

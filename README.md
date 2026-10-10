@@ -75,6 +75,9 @@ func readSelf() (content string, err error) {
 已经可以用了。语法糖在 `cmd/compile/internal/syntax`(解析器) 层脱糖, 类型检查器/IR/SSA/链接器一行都不用改,
 所以内联、逃逸分析、`-race`、调试信息全都是普通 Go 代码的水平。
 
+编辑器/`go vet` 那边走的是标准库 `go/types`, 所以也一并适配了(只需要改 `go/types`,
+`go/parser` 与 `gofmt` 本来就能正确处理 `!err`)。
+
 ```bash
 # 完整构建: 下载官方 go1.27.2 源码(校验 sha256) → 打补丁 → make.bash 自举(约 1~2 分钟)
 scripts/build-toolchain.sh
@@ -117,12 +120,13 @@ x, !err = f()             // 普通赋值同样支持
 1. 裸 `return` 要求函数结果是具名的(或函数没有结果), 例如要写成
    `func f() (s string, err error)`; 结果未具名时会编译报错。
 2. `.gone` 扩展名暂时还不被 `go build` 识别, 需要先改名成 `.go`(见下一条路线图)。
-3. gopls / `go vet` 走的 `go/parser` + `go/types` 还没适配(所以 IDE 里会有红线),
-   但 `gofmt` 已经能正常处理。
+3. gopls 是外部二进制、把 `go/types` 静态链接了进去, 所以要**用 gone 工具链重装一份**:
+   `GOROOT=$PWD/gone-go $PWD/gone-go/bin/go install golang.org/x/tools/gopls@latest`;
+   现成的官方 gopls 里带的还是原版 `go/types`。(`go vet` 已经随工具链准备好了)
 
 ### 路线图
 
 - [x] **M1** 解析器脱糖 `!err`, 重建工具链并验证
 - [ ] **M2** `go/build` + 模块扫描识别 `.gone` 扩展名, `go build ./...` 直接吃 `.gone`
-- [ ] **M3** `go/parser` + `go/types` 支持, 让 gopls / `go vet` / `goimports` 认识 `!err`
+- [x] **M3** `go/types` 支持, 让 `go vet` / gopls 认识 `!err`(`go/parser` 与 `gofmt` 本来就无需改动)
 - [ ] **M4** 结果未具名时自动 `return zero..., err`; 错误信息打磨

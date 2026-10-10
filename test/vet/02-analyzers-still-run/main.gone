@@ -1,0 +1,13 @@
+package main
+
+import "fmt"
+
+func g() (int, error) { return 1, nil }
+
+func printfMistake() {
+	x, !err := g()
+	fmt.Printf("%d\n")
+	_ = x
+}
+
+func main() { printfMistake() }

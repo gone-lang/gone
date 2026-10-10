@@ -1,0 +1,3 @@
+p.go:43:8: !err sugar is not allowed here (only as a direct element of a statement list)
+p.go:51:10: !err sugar is not allowed here (only as a direct element of a statement list)
+errors: 2

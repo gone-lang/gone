@@ -1,0 +1,174 @@
+diff --git a/src/go/types/errsugar.go b/src/go/types/errsugar.go
+new file mode 100644
+index 0000000..680c56d
+--- /dev/null
++++ b/src/go/types/errsugar.go
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package types
++
++import (
++	"go/ast"
++	"go/token"
++	. "internal/types/errors"
++)
++
++// The !err assignment sugar.
++//
++// An assignment of the form
++//
++//	x, !err := f()
++//
++// is shorthand for
++//
++//	x, err := f()
++//	if err != nil {
++//		return
++//	}
++//
++// The '!' marker must immediately precede the name of an error variable on the
++// left-hand side of an assignment. A unary '!' operand is never a valid
++// assignment target in Go, so accepting this form does not change the meaning
++// of any valid Go program.
++//
++// cmd/compile/internal/syntax performs the actual desugaring; the code here
++// only makes go/types agree with the compiler about which forms are accepted,
++// so that tools built on go/types (go vet, gopls, ...) do not report spurious
++// errors. The sugar is permitted only for assignments that are direct elements
++// of a statement list, where the implicit error check can be inserted; the
++// callers that pass a statement along on its own (simpleStmt for the init and
++// post statements of if/for/switch statements, the comm clauses of a select,
++// and the statement of a labeled statement) reject it.
++//
++// The AST is deliberately left untouched: the same AST may be type-checked more
++// than once (gopls does), so rewriting `!err` to `err` in place would make a
++// later run see an ordinary assignment and report "declared and not used".
++// Instead the marked identifiers are related to their variables in Info, which
++// is both accurate (the implicit check reads them) and what tools walking the
++// AST together with Info expect to find.
++
++// errSugarIdent returns the identifier marked with the !err sugar on an
++// assignment left-hand side, i.e. the id in `!id`. Otherwise it returns nil.
++func errSugarIdent(lhs ast.Expr) *ast.Ident {
++	unary, _ := ast.Unparen(lhs).(*ast.UnaryExpr)
++	if unary == nil || unary.Op != token.NOT {
++		return nil
++	}
++	id, _ := ast.Unparen(unary.X).(*ast.Ident)
++	return id
++}
++
++// errSugarLHS separates the !err sugar from an assignment left-hand side.
++// It returns the list to type-check - a copy of lhs with every `!id` replaced
++// by `id` - and the removed `!id` expressions. lhs itself is not modified.
++//
++// `!_` is not the sugar: it is left alone so that it is reported as an error by
++// the ordinary checks (cmd/compile reports "cannot use _ as value or type").
++func errSugarLHS(lhs []ast.Expr) ([]ast.Expr, []ast.Expr) {
++	var sugar []ast.Expr
++	for i, e := range lhs {
++		id := errSugarIdent(e)
++		if id == nil || id.Name == "_" {
++			continue
++		}
++		if sugar == nil {
++			lhs = append([]ast.Expr(nil), lhs...)
++		}
++		lhs[i] = id
++		sugar = append(sugar, e)
++	}
++	return lhs, sugar
++}
++
++// rejectErrSugar reports an error if s is an assignment using the !err sugar.
++// It is used where the implicit error check cannot be inserted: the init and
++// post statements of if/for/switch statements, the comm clauses of a select
++// statement, and the statement of a labeled statement.
++func (check *Checker) rejectErrSugar(s ast.Stmt) {
++	as, _ := s.(*ast.AssignStmt)
++	if as == nil || (as.Tok != token.ASSIGN && as.Tok != token.DEFINE) {
++		return
++	}
++	for _, e := range as.Lhs {
++		if id := errSugarIdent(e); id != nil && id.Name != "_" {
++			check.error(e, BadDecl, "!err sugar is not allowed here (only as a direct element of a statement list)")
++		}
++	}
++}
++
++// markErrSugarUsed relates the expressions of the !err sugar to the error
++// variables they stand for. The desugared code reads those variables in the
++// implicit `if err != nil` check, so:
++//
++//   - the variable is used and must not be reported as unused;
++//   - the identifier is a use of it, and the `!id` expression has its type.
++//
++// The latter two keep the AST and Info consistent for tools that walk the AST
++// together with Info (go vet, gopls) - they see `!id` here rather than the `id`
++// that cmd/compile desugars to. pos must be a valid position at or after the end
++// of the assignment, so that variables declared by it are visible.
++func (check *Checker) markErrSugarUsed(sugar []ast.Expr, pos token.Pos) {
++	if check.usedVars == nil {
++		return
++	}
++	for _, e := range sugar {
++		id := errSugarIdent(e)
++		_, obj := check.scope.LookupParent(id.Name, pos)
++		// It's ok to mark non-local variables, but ignore variables from other
++		// packages to avoid potential race conditions with dot-imported
++		// variables (same reasoning as in lhsVar).
++		if v, _ := obj.(*Var); v != nil && v.pkg == check.pkg {
++			check.recordUse(id, v)
++			check.recordTypeAndValue(e, variable, v.typ, nil)
++			check.usedVars[v] = true
++		}
++	}
++}
+diff --git a/src/go/types/stmt.go b/src/go/types/stmt.go
+index 85c7576..ab56022 100644
+--- a/src/go/types/stmt.go
++++ b/src/go/types/stmt.go
+@@ -100,6 +100,7 @@ const (
+ 
+ func (check *Checker) simpleStmt(s ast.Stmt) {
+ 	if s != nil {
++		check.rejectErrSugar(s)
+ 		check.stmt(0, s)
+ 	}
+ }
+@@ -435,6 +436,7 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
+ 
+ 	case *ast.LabeledStmt:
+ 		check.hasLabel = true
++		check.rejectErrSugar(s.Stmt)
+ 		check.stmt(ctxt, s.Stmt)
+ 
+ 	case *ast.ExprStmt:
+@@ -508,12 +510,14 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
+ 				check.error(s, InvalidSyntaxTree, "missing lhs in assignment")
+ 				return
+ 			}
++			lhs, sugar := errSugarLHS(s.Lhs)
+ 			if s.Tok == token.DEFINE {
+-				check.shortVarDecl(inNode(s, s.TokPos), s.Lhs, s.Rhs)
++				check.shortVarDecl(inNode(s, s.TokPos), lhs, s.Rhs)
+ 			} else {
+ 				// regular assignment
+-				check.assignVars(s.Lhs, s.Rhs)
++				check.assignVars(lhs, s.Rhs)
+ 			}
++			check.markErrSugarUsed(sugar, s.End())
+ 
+ 		default:
+ 			// assignment operations
+@@ -822,6 +826,7 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
+ 
+ 			check.openScope(s, "case")
+ 			if clause.Comm != nil {
++				check.rejectErrSugar(clause.Comm)
+ 				check.stmt(inner, clause.Comm)
+ 			}
+ 			check.stmtList(inner, clause.Body)

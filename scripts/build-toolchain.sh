@@ -172,8 +172,14 @@ build_fast() {
 	echo ">> 源码版本: $(cat "$out/VERSION")"
 	apply_patches "$out"
 
-	echo ">> 重建 cmd/compile -> pkg/tool/${goos}_${goarch}/compile"
-	(cd "$out/src" && GOROOT="$out" "$out/bin/go" build -o "$out/pkg/tool/${goos}_${goarch}/compile" ./cmd/compile)
+	# 补丁改到哪个包, 就要重建哪些预编译工具, 否则 go 命令用的还是旧二进制:
+	#   compile  <- cmd/compile/internal/syntax (M1: !err 脱糖)
+	#   vet      <- go/types                   (M3: go/types 认识 !err)
+	local tool
+	for tool in compile vet; do
+		echo ">> 重建 cmd/$tool -> pkg/tool/${goos}_${goarch}/$tool"
+		(cd "$out/src" && GOROOT="$out" "$out/bin/go" build -o "$out/pkg/tool/${goos}_${goarch}/$tool" "./cmd/$tool")
+	done
 }
 
 if [ "$mode" = fast ]; then
