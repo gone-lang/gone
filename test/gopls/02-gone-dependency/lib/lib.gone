@@ -1,0 +1,3 @@
+package lib
+
+func Double(x int) (int, error) { return 2 * x, nil }

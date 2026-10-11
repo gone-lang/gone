@@ -1,0 +1,71 @@
+{
+  "name": "gone",
+  "displayName": "Gone",
+  "description": "gone 工具链的编辑器支持: 把 .gone 归到 Go 语言, 并一键把 go.goroot / gopls 指到 gone 工具链",
+  "version": "0.1.0",
+  "publisher": "gone-lang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gone-lang/gone.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:go",
+    "onCommand:gone.setupToolchain",
+    "onCommand:gone.doctor"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "go",
+        "extensions": [
+          ".gone"
+        ],
+        "aliases": [
+          "Go"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "gone.setupToolchain",
+        "title": "Gone: 配置 gone 工具链 (go.goroot / gopls)"
+      },
+      {
+        "command": "gone.doctor",
+        "title": "Gone: 环境自检"
+      }
+    ],
+    "configuration": {
+      "title": "Gone",
+      "properties": {
+        "gone.toolchainPath": {
+          "type": "string",
+          "default": "",
+          "description": "gone 工具链目录(GOROOT)。留空时依次看 go.goroot 设置和 GOROOT 环境变量。"
+        },
+        "gone.autoConfigure": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开 .gone 文件时, 自动把 go.goroot 与 go.alternateTools.gopls 指到 gone 工具链(只在没配过时写工作区设置)。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.0"
+  }
+}

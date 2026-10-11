@@ -5,25 +5,28 @@
 #   scripts/build-toolchain.sh --fast --out ./gone-go --force
 #   scripts/test.sh --toolchain ./gone-go
 #
-# 五个套件:
+# 六个套件:
 #   test/cases/           行为用例 (main.gone + want), go run 后的 stdout 必须与 want 一致
 #   test/reject/          非法位置 (main.gone + want), 编译器报错必须与 want 一致 (含行列号)
 #   test/vet/             非法/合法 (main.gone + want), go vet 输出必须与 want 一致
 #   test/e2e/             .gone 扩展名的端到端用例 (run.sh + want), 脚本 stdout 必须与 want 一致
+#   test/gopls/           用 LSP 打开文件后收集诊断, 与 want 一致 (需要打过补丁的 gopls)
 #   test/tools/*/         用 go/types 的检查器小程序 (main.go + want), stdout 必须与 want 一致
 #
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 toolchain="${GONE_GOROOT:-}"
+gopls_bin=""
 filter=""
 
 usage() {
 	cat <<EOF
-用法: $(basename "$0") --toolchain DIR [--filter SUBSTR]
+用法: $(basename "$0") --toolchain DIR [--gopls PATH] [--filter SUBSTR]
 
 选项:
   --toolchain DIR    gone 工具链目录 (build-toolchain.sh 的产物)
+  --gopls PATH       打过补丁的 gopls (默认: <toolchain>/bin/gopls, 由 build-gopls.sh 产出)
   --filter SUBSTR    只跑名字里含 SUBSTR 的用例
   -h, --help         显示本帮助
 EOF
@@ -33,6 +36,10 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--toolchain)
 		toolchain="$2"
+		shift
+		;;
+	--gopls)
+		gopls_bin="$2"
 		shift
 		;;
 	--filter)
@@ -66,6 +73,10 @@ gofmt_bin="$toolchain/bin/gofmt"
 if [ ! -x "$gofmt_bin" ]; then
 	echo "error: $gofmt_bin 不存在或不可执行" >&2
 	exit 2
+fi
+
+if [ -z "$gopls_bin" ]; then
+	gopls_bin="$toolchain/bin/gopls"
 fi
 
 work="$(mktemp -d)"
@@ -241,7 +252,69 @@ $out"
 }
 
 # ---------------------------------------------------------------------------
-# 套件 5: 直接用 go/types 的检查器小程序
+# 套件 5: gopls（走 LSP, 用 test/gopls/lsp_probe.py 模拟"编辑器打开文件"）
+# 需要打过补丁的 gopls（scripts/build-gopls.sh 的产物）与 python3; 缺任一就跳过。
+
+run_gopls() {
+	local dir name tmp probe out rc want opens lang cache
+	if [ ! -x "$gopls_bin" ]; then
+		echo ">> 跳过 gopls 套件: 没有可执行的 gopls ($gopls_bin 不存在, 用 build-gopls.sh 构建)"
+		return
+	fi
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo ">> 跳过 gopls 套件: 需要 python3"
+		return
+	fi
+	probe="$repo_root/test/gopls/lsp_probe.py"
+
+	for dir in "$repo_root"/test/gopls/*/; do
+		[ -d "$dir" ] || continue
+		name="$(basename "$dir")"
+		[ "$name" = "lsp_probe.py" ] && continue
+		selected "$name" || continue
+
+		tmp="$work/gopls-$name"
+		mkdir -p "$tmp"
+		printf 'module gonetest\n\ngo 1.27\n' >"$tmp/go.mod"
+		(cd "$dir" && tar cf - --exclude=./want --exclude=./open --exclude=./lang .) | (cd "$tmp" && tar xf -)
+
+		# 打开哪些文件、"语言"是什么, 可以用 open / lang 文件覆盖默认值
+		opens=(main.gone)
+		if [ -f "$dir/open" ]; then
+			mapfile -t opens <"$dir/open"
+		fi
+		lang="go"
+		if [ -f "$dir/lang" ]; then
+			lang="$(cat "$dir/lang")"
+		fi
+
+		# 每个用例一份全新的 gopls 缓存: 否则结果会受上一次运行的缓存影响
+		cache="$work/gopls-cache-$name"
+		# gopls 需要能在 PATH 里找到 go(gone 工具链的), 光有 GOROOT 不够
+		set +e
+		out="$(cd "$tmp" && GOROOT="$toolchain" PATH="$toolchain/bin:$PATH" GOPLSCACHE="$cache" \
+			python3 "$probe" --gopls "$gopls_bin" --root "$tmp" --lang "$lang" "${opens[@]}" 2>&1)"
+		rc=$?
+		set -e
+		want="$(cat "$dir/want")"
+
+		if [ "$rc" -ne 0 ]; then
+			report "gopls-$name" 0 "LSP 探测失败 (exit=$rc):
+$out"
+			continue
+		fi
+		if [ "$out" != "$want" ]; then
+			report "gopls-$name" 0 "诊断不一致:
+  得到: $(printf '%q' "$out")
+  期望: $(printf '%q' "$want")"
+			continue
+		fi
+		report "gopls-$name" 1
+	done
+}
+
+# ---------------------------------------------------------------------------
+# 套件 6: 直接用 go/types 的检查器小程序
 
 run_tools() {
 	local dir name tmp out want
@@ -277,6 +350,7 @@ run_cases
 run_rejects
 run_vet
 run_e2e
+run_gopls
 run_tools
 
 echo

@@ -1,0 +1,10 @@
+package main
+
+import "fmt"
+
+func g() (int, error) { return 1, nil }
+
+func main() {
+	x, !err := g()
+	fmt.Println(x)
+}

@@ -87,6 +87,10 @@ package main
 ...
 ```
 
+编辑器侧也做了(M5): 一份 VSCode 扩展把 `.gone` 并进 Go 语言
+(高亮、跳转、补全都来自官方 Go 扩展 + 一份用 gone 工具链构建的 gopls),
+外加 Vim/Neovim 的 ftdetect 与 gopls 接法, 详见 [编辑器支持](#编辑器支持)。
+
 ```bash
 # 完整构建: 下载官方 go1.27.2 源码(校验 sha256) → 打补丁 → make.bash 自举(约 1~2 分钟)
 scripts/build-toolchain.sh
@@ -94,7 +98,10 @@ scripts/build-toolchain.sh
 # 或者快速迭代: 复制本机 GOROOT → 打补丁 → 只重建 cmd/compile, cmd/vet, cmd/go, cmd/gofmt
 scripts/build-toolchain.sh --fast --out ./gone-go --force
 
-# 跑测试套件
+# 构建 gopls(打上 editors/gopls/*.patch, 用 gone 工具链编译, 装到 ./gone-go/bin/gopls)
+scripts/build-gopls.sh --toolchain ./gone-go
+
+# 跑测试套件(默认会用 <工具链>/bin/gopls 跑 gopls 套件)
 scripts/test.sh --toolchain ./gone-go
 
 # 使用(在你自己的项目里)
@@ -142,6 +149,46 @@ x, !err = f()             // 普通赋值同样支持
 所以 `main.gone` 加了 `//go:build ignore` 以免重复声明;
 `go run main.gone` 走的是命令行文件模式, 不看构建约束, 所以照样能跑。
 
+### 编辑器支持
+
+语法高亮/跳转/补全/诊断这些, 复用官方 Go 扩展 + 一份打过补丁的 gopls 就够了:
+
+```bash
+# 用 gone 工具链 + editors/gopls/ 的补丁构建 gopls(默认装到 ./gone-go/bin/gopls)
+scripts/build-gopls.sh --toolchain ./gone-go
+```
+
+为什么 gopls 也要自己构建: 它把 `go/types` 静态链接进去了, 官方那份不认识 `!err`;
+而且 gopls 内部还有几处"只看 `.go` 后缀"的文件识别, 不补的话
+`import` 一个用 `.gone` 写的包会报 `missing import ...`(补丁内容见 design.md §3.7)。
+
+**VSCode**: `editors/vscode-gone/` 是一个几十行的小扩展
+
+```bash
+editors/vscode-gone/build.sh          # 产出 editors/vscode-gone/gone.vsix
+code --install-extension editors/vscode-gone/gone.vsix
+```
+
+它把 `.gone` 并进 `go` 语言(沿用内置的 Go 语法高亮与官方 Go 扩展), 并提供两个命令:
+
+- `Gone: 配置 gone 工具链` —— 把 `go.goroot` 和 `go.alternateTools.gopls`
+  写进工作区设置, 指向 gone 工具链与上面构建的 gopls;
+- `Gone: 环境自检` —— 临时写一个带 `!err` 的 `.gone` 文件编译一下,
+  告诉你这份 GOROOT 到底是不是 gone 工具链、gopls 是不是带补丁的那份。
+
+判定"这是不是 gone 工具链"的那段逻辑可以在命令行里单独验(不需要开 VSCode):
+
+```bash
+editors/vscode-gone/check.sh ./gone-go /opt/go
+# ok   .../gone-go: gone=true (期望 true)
+# ok   /opt/go: gone=false (期望 false) — 不认 .gone 语法糖
+```
+
+**Vim / Neovim**: 复制 `editors/vim/gone.vim` 到 `~/.vim/ftdetect/`
+(Neovim: `~/.config/nvim/ftdetect/`), 让 `.gone` 走 Go 的 filetype;
+gopls 的接法见该文件里的注释(要点: 用构建出来的 gopls, `GOROOT` 指向
+gone 工具链, 且 `PATH` 里有 `$GOROOT/bin`)。
+
 ### 当前限制
 
 1. 裸 `return` 要求函数结果是具名的(或函数没有结果), 例如要写成
@@ -149,13 +196,17 @@ x, !err = f()             // 普通赋值同样支持
 2. `.gone` 只被 gone 工具链识别。换官方工具链就得改名成 `.go`;
    第三方工具(编辑器、gopls、各种 lint)各有各的目录扫描逻辑, 未必认这个扩展名。
    另外 `internal/goroot`(判断"这是不是标准库包")仍只看 `.go`, 标准库本身改写不在支持范围。
-3. gopls 是外部二进制、把 `go/types` 静态链接了进去, 所以要**用 gone 工具链重装一份**:
-   `GOROOT=$PWD/gone-go $PWD/gone-go/bin/go install golang.org/x/tools/gopls@latest`;
-   现成的官方 gopls 里带的还是原版 `go/types`。(`go vet` 已经随工具链准备好了)
+3. 编辑器侧要用 `scripts/build-gopls.sh` 构建出来的 gopls(gone 工具链 + x/tools 补丁),
+   官方那份不行: 它带的 `go/types` 不认识 `!err`, 文件识别也不认 `.gone`。
+   `go vet` 不用管, 它随工具链准备好了。
+4. VSCode 官方 Go 扩展内部还有几处 `fileName.endsWith('.go')`(覆盖率装饰、
+   生成测试、调试配置等), 这些功能对 `.gone` 不生效; 语言服务器重启、`go.mod`
+   换工具链这些仍按 Go 扩展原有逻辑走。
 
 ### 路线图
 
 - [x] **M1** 解析器脱糖 `!err`, 重建工具链并验证
 - [x] **M2** 工具链识别 `.gone` 扩展名(`go/build`、模块索引、`go` 命令、`go/parser.ParseDir`、`go/doc`、`gofmt`), `go build ./...` 直接吃 `.gone`
 - [x] **M3** `go/types` 支持, 让 `go vet` / gopls 认识 `!err`
+- [x] **M5** 编辑器侧: VSCode 扩展 + Vim ftdetect + `x/tools`/gopls 补丁 + `build-gopls.sh`
 - [ ] **M4** 结果未具名时自动 `return zero..., err`; 错误信息打磨

@@ -1,0 +1,8 @@
+# gone 编辑器补丁跟随的上游 x/tools 版本。
+# 换版本(或升级 gopls)后需要重新验证 editors/gopls/*.patch 是否能干净应用。
+#
+# gopls 是 x/tools 仓库里的子模块(golang.org/x/tools/gopls),
+# 钉在它自己的 tag 上即可, HEAD 是 x/tools 那一侧的提交号。
+GONE_GOPLS_TAG=gopls/v0.23.0
+GONE_X_TOOLS_REPO=https://github.com/golang/tools.git
+GONE_X_TOOLS_COMMIT=014f87ff5c01915bc90f4f11a6bb8aea3e0edbd7

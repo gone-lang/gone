@@ -281,6 +281,63 @@ func IsTestGoFile(name string) bool
   这样 `go build ./...` 和 `go run example/main.gone` 都能用。
 
 
+### 3.7 补丁点 4：编辑器侧（`x/tools` / gopls，M5）
+
+编译器、`go/types`、`go` 命令都就位之后，编辑器里还差两步：
+
+1. **`.gone` 文件要落到 Go 语言上。** VSCode 那边 `golang.go` 只声明了
+   `{id: "go", extensions: [".go"]}`，Go 的语法高亮是 VSCode 内置的
+   （`source.go`）。所以只要有一个扩展把 `.gone` 并进 `go` 语言 id，
+   官方 Go 扩展（gopls 客户端、调试、测试透镜…）就会接管；Neovim/Vim 侧
+   一行 `ftdetect`（`setfiletype go`）即可。
+2. **gopls 自己也要认识 `.gone`。** gopls 通过 `go list` 拿文件列表（M2 之后
+   已经包含 `.gone`），但它内部还有若干处"只看 `.go` 后缀"的判断，
+   这些判断让 `.gone` 文件在**没被打开**时不算 Go 文件，最典型的表现是：
+
+   ```
+   main.gone:6:2: could not import example/lib (missing import example/lib)
+   ```
+
+   即一个包 import 了另一个用 `.gone` 写的包时，gopls 认为那个包是空的。
+
+所以 M5 也需要一份补丁，落点是 `x/tools`（gopls 是它的子模块）：
+
+| 文件 | 改动 |
+|---|---|
+| `gopls/internal/file/kind.go` | 新增 `IsGoFile`/`IsTestGoFile`（转发到工具链的 `go/build`）；`KindForLang` 也认 `gone` 这个 languageId |
+| `gopls/internal/cache/{parse,snapshot,session}.go` | 解析前的扩展名检查、`fileKind` 的扩展名 switch、改文件后 metadata 失效判断 |
+| `gopls/internal/server/{diagnostics,command}.go` | 「整个目录里有没有 Go 代码」的目录扫描、文件参数转目录 |
+| `gopls/internal/golang/{compileropt,rename_check,addtest}.go` | options 文件过滤、改名时的忽略文件判断、生成测试文件名（`x.gone` → `x_test.gone`） |
+| `gopls/internal/cmd/cmd.go` | 命令行子命令按扩展名推断 languageId |
+| `go/packages/golist.go` | `go list` 结果里 `CompiledGoFiles` 的过滤（**上面那条 missing import 的根因**） |
+| `internal/{imports,gopathwalk,modindex}`、`cmd/goimports` | 目录扫描、依赖包符号索引、goimports 的文件判断 |
+
+和 M2 的思路一样：这些判断都改成调用工具链的 `go/build.IsGoFile`（gopls 内部再包一层
+`gopls/internal/file.IsGoFile`）。这也意味着**补丁后的 gopls 必须用 gone 工具链构建**，
+否则 `build.IsGoFile` 都不存在 —— 这正好也是它本来就需要的东西（gopls 静态链接了
+`go/types`，官方工具链的 `go/types` 不认识 `!err`）。
+
+分发方式（不发布到市场，全部本地构建）：
+
+- `scripts/build-gopls.sh`：克隆 `editors/gopls/VERSION` 钉住的 `gopls/v0.23.0`
+  （提交号也钉住了）→ 应用 `editors/gopls/*.patch` → 用 gone 工具链构建到
+  `<工具链>/bin/gopls` → 最后做一次**自检**（用 LSP 探测一个含语法糖的 `.gone` 工程，
+  要求零诊断）。
+- `editors/vscode-gone/`：一个很小的 TS 扩展。语言贡献把 `.gone` 并进 `go`
+  （并在打开时用 `setTextDocumentLanguage` 兜底），另外提供
+  「Gone: 配置 gone 工具链」（把 `go.goroot`、`go.alternateTools.gopls` 写到工作区设置）
+  和「Gone: 环境自检」（临时写一个带 `!err` 的 `.gone` 文件并用该工具链编译，
+  判断这份 GOROOT 到底是不是 gone 工具链）两个命令。
+  判定逻辑单独放在 `src/toolchain.ts`（不依赖 VSCode API），
+  所以能用普通 node 跑：`editors/vscode-gone/check.sh <gone 工具链> <普通工具链>`；
+  `build.sh` 负责 `tsc` + 打包 `.vsix`（不发布市场）。
+- `editors/vim/gone.vim`：ftdetect + gopls 接法示例。
+
+编辑器集成有些地方注定是我们管不到的：VSCode Go 扩展内部也有几处
+`fileName.endsWith('.go')`（覆盖率装饰、生成测试、调试配置），这些功能对 `.gone`
+不生效；`go.mod` 里换工具链、语言服务器重启等仍按 Go 扩展原有逻辑走。
+
+
 ## 4. 限制
 
 1. **裸 `return` 要求函数结果全为具名，或函数没有结果。**
@@ -315,8 +372,9 @@ func IsTestGoFile(name string) bool
 | **M1** | `cmd/compile/internal/syntax` 解析器脱糖 `!err`，重建工具链并验证 | ✅ 已完成 |
 | **M2** | 工具链识别 `.gone` 扩展名（`go/build`、模块索引、`go` 命令、`go/parser.ParseDir`、`go/doc`、`gofmt`），`go build ./...` 直接吃 `.gone` | ✅ 已完成 |
 | **M3** | `go/types` 支持，让 `go vet` / gopls 认识 `!err` | ✅ 已完成 |
+| **M5** | 编辑器侧：VSCode 扩展 + Vim ftdetect + `x/tools`/gopls 补丁 + `build-gopls.sh` | ✅ 已完成 |
 | M4 | 结果未具名时自动 `return zero..., err`（需要类型信息，在 noder/types 层补）；错误信息打磨 | 待定 |
-| M5 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
+| M6 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
 
 M1/M3 只管语法糖本身，`.gone` 扩展名由 M2 补齐；两者互不依赖
 （只改编译器、不认 `.gone` 时，把文件改名成 `.go` 也能用）。
@@ -330,7 +388,10 @@ scripts/build-toolchain.sh
 # 快速迭代：复制本机 GOROOT → 打补丁 → 只重建 cmd/compile、cmd/vet、cmd/go、cmd/gofmt（约 30 秒）
 scripts/build-toolchain.sh --fast --out ./gone-go --force
 
-# 用产物跑测试套件
+# 构建 gopls(打上 editors/gopls/*.patch, 用 gone 工具链编译, 装到 ./gone-go/bin/gopls)
+scripts/build-gopls.sh --toolchain ./gone-go
+
+# 用产物跑测试套件(默认会用 <工具链>/bin/gopls 跑 gopls 套件)
 scripts/test.sh --toolchain ./gone-go
 
 # 日常使用
@@ -364,12 +425,19 @@ go build ./...
 - `test/e2e/*/` —— `.gone` 端到端用例（`run.sh` + `want`）：多文件包、命令行文件参数、
   `go test`（含故意失败的用例）、`go vet` 分析器、构建约束/`GOOS` 后缀、`gofmt`/`go fmt`、
   `go clean`、`go doc`。
+- `editors/vscode-gone/check.sh` —— 工具链判定逻辑的冒烟测试（需要一个 gone 工具链
+  和一个普通工具链作为反例），不需要开 VSCode。
+- `test/gopls/*/` —— 编辑器侧：`test/gopls/lsp_probe.py` 是个极简 LSP 客户端，
+  按"编辑器打开文件"的方式给 gopls 发 `didOpen`（`languageId=go`）再收集诊断，
+  与 `want` 比对。每个用例用独立的 `GOPLSCACHE`，否则缓存会让结果不稳定。
+  没给 `--gopls` 且 `<工具链>/bin/gopls` 不存在、或没有 python3 时，这个套件会被跳过。
 - `test/tools/gotypescheck/` —— 直接用 `go/parser` + `go/types` 类型检查一段固定源码，
   比对诊断列表（覆盖「声明但未使用」这类需要 `Info` 完整性的场景）。
 
 ## 7. 已验证内容
 
-- `scripts/test.sh`：24/24 通过，覆盖 5 个套件（`--fast` 与完整自举两套工具链）。
+- `scripts/test.sh`：29/29 通过，覆盖 6 个套件（`--fast` 与完整自举两套工具链，
+  外加 `./gone-go/bin/gopls` 的 gopls 套件）。
   M2 的 `test/e2e/*` 覆盖：多文件包、命令行文件参数、`_test.gone`（含故意失败的用例）、
   `go vet` 分析器、构建约束与 `GOOS` 后缀、`gofmt`/`go fmt`、`go clean`、`go doc`。
 - M2 补丁（`toolchain/0003-*.patch`）在官方 `go1.27.2.src.tar.gz` 上从头 `patch -p1 -N --fuzz=3`，
@@ -382,15 +450,27 @@ go build ./...
 - M3 端到端：`go vet` 在语法糖代码上不再 panic 且仍能查出 printf 问题；
   用 gone 工具链重装的 gopls 对合法糖零诊断、对非法位置报出与编译器同位置的错误。
 - M3 幂等性：同一份 AST 连续类型检查 3 次结果一致（gopls 会重复检查，这点专门验证过）。
-- M2+M3 端到端（编辑器侧）：用 gone 工具链重新安装的 `gopls v0.23.0`
-  对 `.gone` 与 `.go` 里的合法糖都是零诊断，`gopls check main.gone` 能直接类型检查 `.gone`；
-  用 M3 修复前的工具链构建的旧 gopls 会报 `declared and not used: err`，
-  所以升级工具链后必须重装 gopls。
+- M5 编辑器侧：`scripts/build-gopls.sh` 从零跑通（克隆 `gopls/v0.23.0` → 打补丁 →
+  用 gone 工具链构建 → LSP 自检）。`test/gopls/*` 用 LSP 探测，
+  关掉缓存后**可复现**地抓到补丁前后的差别：
+  - 补丁前：`main.gone:6:2: could not import gonetest/lib (missing import gonetest/lib)`（连续 3 次）；
+  - 补丁后：同一个工程零诊断，且非法位置的报错位置与编译器一致（都指向 `!`）。
+  另外验证了编辑器侧的几个场景：`languageId=go` 与 `languageId=gone` 都能工作；
+  未打开的兄弟 `.gone` 文件里写错也会被报出来；补丁后 x/tools 全量 `go build ./...` 通过。
+- M5 VSCode 扩展：`tsc` 编译通过、`build.sh` 打包出 7.8KB 的 `.vsix`；
+  `check.sh` 用普通 node 验证工具链判定（`./gone-go` 判为 gone 工具链、
+  `/opt/go` 判为普通工具链）。扩展本身的 UI 行为没有自动化测试（跑 VSCode 集成测试太重），
+  这是已知缺口。
+- M3 端到端（旧）：`gopls check` 在语法糖代码上零诊断；用 M3 修复前的工具链构建的
+  旧 gopls 会报 `declared and not used: err`，所以升级工具链后必须重建 gopls。
 
 ## 8. 风险
 
 - **补丁跟随上游**：Go 每个版本 `cmd/compile/internal/syntax` 与 `go/types` 都可能微调，
   升级时需要重新 rebase 补丁（补丁都很小，成本可控）。
+- **编辑器侧依赖一个外部仓库**：M5 的补丁钉在 `gopls/v0.23.0`（提交号记在
+  `editors/gopls/VERSION`），gopls 升级时补丁同样要 rebase；补丁后的 gopls 只能用
+  gone 工具链构建（补丁里直接用了 `go/build.IsGoFile`）。
 - **扩展名判断点在 cmd/go 里有多份副本**：`modindex` 与 `fsys` 各自有一份"目录里有没有 Go 文件"
   的实现，上游新增类似判断点时补丁需要跟着补（本轮已把能收敛的都收敛到 `go/build.IsGoFile`）。
 - **`Info` 完整性是 M3 的隐性契约**：因为不改写 AST（为了可重复检查），

@@ -1,0 +1,12 @@
+package main
+
+import (
+	"fmt"
+
+	"gonetest/lib"
+)
+
+func main() {
+	v, !err := lib.Double(21)
+	fmt.Println(v)
+}
