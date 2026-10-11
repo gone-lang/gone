@@ -1,0 +1,5 @@
+main.gone:11:5: syntax error: !err sugar requires named results (write func f() (s string, err error))
+main.gone:16:2: syntax error: !err sugar requires named results (write func f() (s string, err error))
+main.gone:22:5: syntax error: !err sugar requires named results (write func f() (s string, err error))
+main.gone:28:6: syntax error: !err sugar requires named results (write func f() (s string, err error))
+main.gone:36:6: syntax error: !err sugar requires named results (write func f() (s string, err error))

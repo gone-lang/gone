@@ -1,0 +1,1 @@
+main.gone:6:5: !err sugar requires named results (write func f() (s string, err error))

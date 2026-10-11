@@ -82,7 +82,10 @@ if e1 != nil || e2 != nil {
 
 约束：`!err` 只能是**语句列表中直接出现的赋值语句**。因为脱糖会插入一条新语句，
 所以 if / for / switch 的 init、post 位置，以及 `select` 的 comm 子句里都没有地方放它，
-这些位置会被明确报错（见 §3.3）。
+这些位置会被明确报错（见 §3.3.1）。
+
+另一个约束：展开出的裸 `return` 要求函数**没有结果或结果全部具名**
+（`func f() (s string, err error)`），否则在 `!` 处报错（见 §3.3.2）。
 
 ### 2.3 为什么 100% 向后兼容
 
@@ -126,14 +129,14 @@ if e1 != nil || e2 != nil {
 
 - **改动面最小**：types2、noder、walk、ssa、链接器一行都不用动。
 - **自动获得所有后端能力**：内联、逃逸分析、调试信息、`-race`、泛型……都是普通 Go 代码。
-- **补丁只有 2 个文件**（1 个新增 + 3 处小改）。
+- **补丁只有 2 个文件**（1 个新增 + 几处小改）。
 
 补丁内容：
 
 | 文件 | 改动 |
 |---|---|
-| `src/cmd/compile/internal/syntax/errsugar.go` | 新增。识别 `!name`、剥掉 `!`、构造隐式 `if` 语句 |
-| `src/cmd/compile/internal/syntax/parser.go` | 3 处钩子：`stmtList` 里脱糖；`simpleStmt`（header 上下文）与 `commClause` 里报错 |
+| `src/cmd/compile/internal/syntax/errsugar.go` | 新增。识别 `!name`、剥掉 `!`、构造隐式 `if` 语句、检查结果列表是否允许裸 `return`（§3.3） |
+| `src/cmd/compile/internal/syntax/parser.go` | 钩子：`stmtList` 里脱糖；`simpleStmt`（header 上下文）与 `commClause` 里报错；`funcBody` 记录当前函数的结果列表 |
 
 （工具链生态侧的第二个补丁见 §3.5。）
 
@@ -150,7 +153,9 @@ AST 层面就是拼现成节点，没有任何新节点类型：
 
 （`nil` 在语法树里就是 `*Name{Value: "nil"}`，类型检查时按预声明对象解析。）
 
-### 3.3 非法位置报错
+### 3.3 报错信息
+
+#### 3.3.1 非法位置
 
 脱糖会插入新语句，所以只允许出现在语句列表里。其余位置给出明确错误，
 而不是让用户看到类型检查器那句困惑的 `non-name !err on left side of :=`：
@@ -161,6 +166,26 @@ AST 层面就是拼现成节点，没有任何新节点类型：
 ./main.go:6:12: syntax error: !err sugar is not allowed in switch statement header
 ./main.go:6:10: syntax error: !err sugar is not allowed in select case
 ```
+
+### 3.3.2 结果未具名
+
+语法糖展开出的是**裸 `return`**，所以函数必须有地方可返回：要么没有结果，
+要么结果全部具名（`_` 也算具名 —— `func f() (_ int, err error)` 是合法 Go）。
+否则在 `!` 的位置报：
+
+```
+./main.gone:11:5: syntax error: !err sugar requires named results (write func f() (s string, err error))
+```
+
+M1 时期这里没有专门检查，用户看到的是类型检查器那句难懂的
+`not enough return values`（go/types 侧则**完全没提示**，编辑器绿灯但 `go build` 失败）。
+现在判定放在解析器里：`funcBody` 把当前函数的结果列表存到 `p.errSugarResults`
+（函数体结束即恢复），`desugarErrAssign` 检查它。因此：
+
+- 嵌套语句块、`if` 体里的语法糖都能拿到同一个结果列表；
+- 闭包有自己的结果列表（`func() { ... }` 没有结果，所以即使在结果是未具名的函数里也合法）；
+- 位置与消息能和 `go/types`（§3.5）逐字对齐：`go build` 指向 `!`，
+  `go vet` / gopls 诊断指向同一处、同样的文本（只差编译器那个 `syntax error: ` 前缀）。
 
 ### 3.4 行号与调试信息
 
@@ -192,8 +217,8 @@ $ go build -gcflags=-S .
 
 | 文件 | 改动 |
 |---|---|
-| `src/go/types/errsugar.go` | 新增。识别并剥离 `!id`、拒绝非法位置、补齐 `Info`（见下） |
-| `src/go/types/stmt.go` | 4 处小改：赋值语句处处理语法糖；`simpleStmt` / `labeledStmt` / select comm 三处拒绝 |
+| `src/go/types/errsugar.go` | 新增。识别并剥离 `!id`、拒绝非法位置、检查结果是否具名、补齐 `Info`（见下） |
+| `src/go/types/stmt.go` | 5 处小改：赋值语句处处理语法糖；`simpleStmt` / `labeledStmt` / select comm 三处拒绝 |
 
 只动这两个文件是有意的：`go/types` 里有一部分文件是由 `cmd/compile/internal/types2`
 **生成**的（见 `generate_test.go` 的 `filemap`），改它们就必须同步改 types2，
@@ -220,6 +245,17 @@ $ go build -gcflags=-S .
 语法糖没有落脚点的入口。报错文本与编译器一致
 （`!err sugar is not allowed here (only as a direct element of a statement list)`），
 位置也一样指向 `!`。
+
+「结果是否具名」同样在两边对齐：`checkErrSugarResults` 在赋值语句的钩子里
+（紧接 `markErrSugarUsed`）检查 `check.sig.Results()`，任一结果没有名字就在 `!` 的位置报
+`!err sugar requires named results (write func f() (s string, err error))`。
+用 `check.sig`（当前函数的签名）而不是自己回溯 AST，是因为它由 `funcBody` 维护，
+闭包/方法/嵌套都是对的；注意 `sig.Results()` 在没有结果时返回 `nil`，
+`Var.name` 为空才算未具名（`_` 是名字）。
+
+这一步的意义主要是**消灭"编辑器绿灯但编译不过"**：M4′ 之前编译器报的是
+`not enough return values`（位置指向 `!`，但没人看得出跟语法糖有关），
+而 `go/types` 侧一声不吭，于是 gopls 给不出任何诊断。
 
 边界：`!_` 不算语法糖，两边一致地报 `cannot use _ as value or type`。
 两个小约定：错误码来自 `internal/types/errors`，新文件要照 go/types 的惯例加
@@ -346,12 +382,19 @@ func IsTestGoFile(name string) bool
    ```go
    func f() (string, error) {        // 结果未具名
        x, !err := g()
-       return                         // ← 编译错误: not enough return values
+       return                         // ← 编译错误
    }
    ```
 
-   解决办法：写成 `func f() (s string, err error)`。
-   要做到「自动 `return zero..., err`」需要类型信息，属后续里程碑（见 M4）。
+   解决办法：写成 `func f() (s string, err error)`。报错位置指向 `!`，消息是
+   `!err sugar requires named results (write func f() (s string, err error))`
+   （编译器带 `syntax error: ` 前缀），`go vet` 与 gopls 报同一句话、同一位置 ——
+   详见 §3.3.2 与 §3.5。
+
+   这是**有意保持**的：语法糖只展开成裸 `return`，不去猜返回值。
+   自动补 `return zero..., err` 需要类型信息（在 types2/noder 层才拿得到），
+   代价是"出错却返回零值继续跑"变得隐蔽，而且展开后的代码不再一眼可读 ——
+   与「展开结果一目了然」这个卖点冲突。所以 M4 的第一半决定不做（见 §5）。
 
 2. **`.gone` 只在 gone 工具链里被识别。**
    用 gone 工具链的 `go build` / `go run` / `go test` / `go vet` / `go doc` / `gofmt`
@@ -372,8 +415,9 @@ func IsTestGoFile(name string) bool
 | **M1** | `cmd/compile/internal/syntax` 解析器脱糖 `!err`，重建工具链并验证 | ✅ 已完成 |
 | **M2** | 工具链识别 `.gone` 扩展名（`go/build`、模块索引、`go` 命令、`go/parser.ParseDir`、`go/doc`、`gofmt`），`go build ./...` 直接吃 `.gone` | ✅ 已完成 |
 | **M3** | `go/types` 支持，让 `go vet` / gopls 认识 `!err` | ✅ 已完成 |
+| **M4′** | 结果未具名时给专门报错，编译器与 `go/types` 的位置、文本一致（原先 `go/types` 完全没提示，"编辑器绿灯但编译不过"）| ✅ 已完成 |
 | **M5** | 编辑器侧：VSCode 扩展 + Vim ftdetect + `x/tools`/gopls 补丁 + `build-gopls.sh` | ✅ 已完成 |
-| M4 | 结果未具名时自动 `return zero..., err`（需要类型信息，在 noder/types 层补）；错误信息打磨 | 待定 |
+| ~~M4~~ | 结果未具名时自动 `return zero..., err` | ❌ 不做：语法糖只展开成裸 `return`，"结果要具名"是预期行为（见 §4.1） |
 | M6 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
 
 M1/M3 只管语法糖本身，`.gone` 扩展名由 M2 补齐；两者互不依赖
@@ -418,10 +462,11 @@ go build ./...
 测试套件：
 
 - `test/cases/*/` —— 行为用例（成功继续执行 / 错误传播 / 多标记 / 普通赋值 / 取反不受影响 /
-  `:=` 重复声明具名结果 / 连续多个糖），比对 stdout。
-- `test/reject/*/` —— 非法位置用例，比对编译报错文本**含行列号**（确保 `!` 被精确指向）。
+  `:=` 重复声明具名结果 / 连续多个糖 / 没有结果或结果全具名），比对 stdout。
+- `test/reject/*/` —— 编译期报错用例（非法位置、结果未具名），
+  比对报错文本**含行列号**（确保 `!` 被精确指向）。
 - `test/vet/*/` —— `go vet`（走 `go/types`）用例：合法糖必须干净通过、
-  真 bug 仍要报出来、非法位置要报出 `go/types` 的错误。
+  真 bug 仍要报出来、非法位置与结果未具名要报出与编译器同位置同文本的错误。
 - `test/e2e/*/` —— `.gone` 端到端用例（`run.sh` + `want`）：多文件包、命令行文件参数、
   `go test`（含故意失败的用例）、`go vet` 分析器、构建约束/`GOOS` 后缀、`gofmt`/`go fmt`、
   `go clean`、`go doc`。
@@ -436,7 +481,7 @@ go build ./...
 
 ## 7. 已验证内容
 
-- `scripts/test.sh`：29/29 通过，覆盖 6 个套件（`--fast` 与完整自举两套工具链，
+- `scripts/test.sh`：33/33 通过，覆盖 6 个套件（`--fast` 与完整自举两套工具链，
   外加 `./gone-go/bin/gopls` 的 gopls 套件）。
   M2 的 `test/e2e/*` 覆盖：多文件包、命令行文件参数、`_test.gone`（含故意失败的用例）、
   `go vet` 分析器、构建约束与 `GOOS` 后缀、`gofmt`/`go fmt`、`go clean`、`go doc`。
@@ -449,6 +494,16 @@ go build ./...
 - 行号：`-gcflags=-S` 确认 nil 检查的代码归属行 == `!err` 所在行。
 - M3 端到端：`go vet` 在语法糖代码上不再 panic 且仍能查出 printf 问题；
   用 gone 工具链重装的 gopls 对合法糖零诊断、对非法位置报出与编译器同位置的错误。
+- M4′：`go build`、`go vet`（重建过的 `vet`）、gopls 三方对同一个"结果未具名"的文件
+  报出**同一位置、同一句话**（`11:5` / `!err sugar requires named results (...)`，
+  编译器多一个 `syntax error: ` 前缀）；`test/reject/05`、`test/vet/04`、
+  `test/gopls/06` 分别锁住这三处，`test/cases/09` 锁住"没有结果 / 结果全具名 / 闭包内"
+  这些合法形式。另外确认：解析器报了错之后编译器不会再补一句 types2 的
+  `not enough return values`（语法错误会在类型检查前中止）。
+- M4′ 回归：`go test cmd/compile/internal/syntax cmd/compile/internal/types2 go/types`
+  全绿（注意 `go/types` 的 `TestGenerate` 也在其中 —— 它要求生成文件与 `types2` 一致，
+  所以顺便验证了「改的两个文件不在生成表内」）；`editors/vscode-gone/check.sh`
+  的工具链判定也照旧通过（它的自检 fixture 是 `func main()`，本来就不受这条限制影响）。
 - M3 幂等性：同一份 AST 连续类型检查 3 次结果一致（gopls 会重复检查，这点专门验证过）。
 - M5 编辑器侧：`scripts/build-gopls.sh` 从零跑通（克隆 `gopls/v0.23.0` → 打补丁 →
   用 gone 工具链构建 → LSP 自检）。`test/gopls/*` 用 LSP 探测，
@@ -477,10 +532,13 @@ go build ./...
   `!err` 这个表达式节点会留在 AST 里，必须靠我们补的 `Uses` / `Types` 条目
   让遍历 AST 的工具满意。目前已知 `go vet`（`satisfy`）与 gopls 依赖这一点；
   将来若遇到别的工具越界报错，优先沿用「补齐 `Info`」的思路，而不是改写 AST。
-- **`go/types` 与 `types2` 出现分叉**：`types2` 是由 `go/types` 生成的副本
-  （`cmd/compile/internal/types2/generate.sh`）。本补丁只加在 `go/types`：
-  编译器不需要它，因为 `cmd/compile` 在解析器层就已经脱糖了（§3.2）。
-  如果哪天重新生成 `types2`，会顺带带上这段代码，功能上无害（编译器永远看不到 `!err`）。
+- **`go/types` 与 `types2` 出现分叉**：`go/types` 里有一批文件是由 `types2` 生成的
+  （`go/types/generate_test.go`，`srcDir = /src/cmd/compile/internal/types2/`）。
+  本补丁只加在 `go/types` 两个**不在生成表内**的文件（`errsugar.go` 是新增的、
+  `stmt.go` 属于 go/types 独有），所以 `TestGenerate` 不会红；
+  如果哪天 `stmt.go` 进了生成表，就要把这几处改动同步到 types2 ——
+  不过编译器其实不需要它，因为 `cmd/compile` 在解析器层就已经脱糖了（§3.2），
+  多余的检查对 `!err` 永远不会触发。
 - **生态意外**：语法糖在**所有** `.go` 文件里都生效（不只是 `.gone`）。
   考虑到 §2.3 的完全向后兼容性，这不会改变任何现有程序的语义；
   但确实会让「写错的文件」报出不同的错误信息。若将来需要收敛，

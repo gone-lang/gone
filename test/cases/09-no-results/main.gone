@@ -1,0 +1,36 @@
+package main
+
+import "fmt"
+
+func g() (int, error) { return 1, nil }
+
+func g2() error { return nil }
+
+// 没有结果的函数: bare return 合法, 语法糖可用
+func noResults() {
+	!err := g2()
+	fmt.Println("noResults done")
+}
+
+// _ 算具名结果
+func blankIsNamed() (_ int, err error) {
+	!err = g2()
+	return
+}
+
+// 外层函数结果是未具名的, 但内层闭包没有结果: 闭包内合法
+func outer() (int, error) {
+	f := func() {
+		!err := g2()
+		fmt.Println("closure done")
+	}
+	f()
+	return g()
+}
+
+func main() {
+	noResults()
+	blankIsNamed()
+	x, !err := outer()
+	fmt.Println("got", x)
+}

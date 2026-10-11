@@ -192,7 +192,20 @@ gone 工具链, 且 `PATH` 里有 `$GOROOT/bin`)。
 ### 当前限制
 
 1. 裸 `return` 要求函数结果是具名的(或函数没有结果), 例如要写成
-   `func f() (s string, err error)`; 结果未具名时会编译报错。
+   `func f() (s string, err error)`; 结果未具名时会在 `!` 的位置报错
+   (编译器: `syntax error: !err sugar requires named results (write func f() (s string, err error))`;
+   `go vet`/gopls 报同样的消息, 只是没有 `syntax error:` 前缀):
+
+   ```go
+   func bad() (string, error) {
+   	s, !err := f() // !err sugar requires named results ...
+   	return s, nil
+   }
+   ```
+
+   这是**有意的设计**, 不是待修的缺陷: 语法糖只展开成裸 `return`, 不去猜该返回什么。
+   自动补一个 `return zero..., err` 看着方便, 但会让"出错了却返回零值继续跑"这种事变隐蔽,
+   而且展开后的代码不再能一眼看懂 —— 语法糖的卖点就是"展开结果一目了然"。
 2. `.gone` 只被 gone 工具链识别。换官方工具链就得改名成 `.go`;
    第三方工具(编辑器、gopls、各种 lint)各有各的目录扫描逻辑, 未必认这个扩展名。
    另外 `internal/goroot`(判断"这是不是标准库包")仍只看 `.go`, 标准库本身改写不在支持范围。
@@ -208,5 +221,10 @@ gone 工具链, 且 `PATH` 里有 `$GOROOT/bin`)。
 - [x] **M1** 解析器脱糖 `!err`, 重建工具链并验证
 - [x] **M2** 工具链识别 `.gone` 扩展名(`go/build`、模块索引、`go` 命令、`go/parser.ParseDir`、`go/doc`、`gofmt`), `go build ./...` 直接吃 `.gone`
 - [x] **M3** `go/types` 支持, 让 `go vet` / gopls 认识 `!err`
+- [x] **M4′** 结果未具名时给专门报错(编译器与 `go/types` 位置、文本一致)。
+  原先只有编译器报含糊的 `not enough return values`, `go vet`/gopls 完全没提示,
+  编辑器绿灯但 `go build` 失败 —— 见「当前限制 1」
 - [x] **M5** 编辑器侧: VSCode 扩展 + Vim ftdetect + `x/tools`/gopls 补丁 + `build-gopls.sh`
-- [ ] **M4** 结果未具名时自动 `return zero..., err`; 错误信息打磨
+- **M4** 结果未具名时自动 `return zero..., err` —— **不做**。语法糖只展开成裸 `return`,
+  "结果要具名"是预期行为(见「当前限制」)
+- [ ] **M6** 更多语法糖变体(如 `!panic`、`!continue`) —— 需要先讨论语法, 避免歧义

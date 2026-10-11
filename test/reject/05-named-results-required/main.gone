@@ -1,0 +1,42 @@
+package main
+
+type T int
+
+func g() (int, error) { return 0, nil }
+
+func g2() error { return nil }
+
+// 结果列表里有未具名的结果, 隐式的 return 无法确定返回值
+func unnamedMulti() (int, error) {
+	x, !err := g()
+	return x, nil
+}
+
+func unnamedSingle() error {
+	!err := g2()
+	return nil
+}
+
+// 方法、嵌套语句块、函数字面量里的 !err 同样受限
+func (t T) method() (int, error) {
+	x, !err := g()
+	return x, nil
+}
+
+func nested() (int, error) {
+	if true {
+		x, !err := g()
+		_ = x
+	}
+	return 0, nil
+}
+
+func literal() {
+	f := func() (int, error) {
+		x, !err := g()
+		return x, nil
+	}
+	_ = f
+}
+
+func main() {}

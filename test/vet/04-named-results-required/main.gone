@@ -1,0 +1,8 @@
+package main
+
+func g() (int, error) { return 1, nil }
+
+func unnamed() (int, error) {
+	x, !err := g()
+	return x, nil
+}

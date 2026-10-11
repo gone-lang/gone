@@ -1,0 +1,131 @@
+diff --git a/src/cmd/compile/internal/syntax/errsugar.go b/src/cmd/compile/internal/syntax/errsugar.go
+--- a/src/cmd/compile/internal/syntax/errsugar.go
++++ b/src/cmd/compile/internal/syntax/errsugar.go
+@@ -29,6 +29,10 @@
+ // check has to be inserted right after the assignment. Using it in the init or
+ // post part of an if/for/switch statement, or in a select comm clause, is
+ // reported as an error.
++//
++// The implicit error check ends in a bare 'return', so the sugar requires the
++// enclosing function to have no results or only named ones. go/types enforces
++// the same requirement, see go/types/errsugar.go.
+ 
+ // errSugarOp reports the unary '!' operation and its operand name if x is a
+ // candidate for the !err sugar, i.e. x has the form '!name'. Otherwise both
+@@ -143,5 +147,29 @@
+ 	if len(names) == 0 {
+ 		return list
+ 	}
++	// The implicit error check returns from the enclosing function, so the
++	// function must have somewhere to return to: either no results at all or
++	// only named ones. go/types reports the same error at the same position,
++	// so that editors do not stay silent about a program that cannot build.
++	if !errSugarResultsOK(p.errSugarResults) {
++		p.syntaxErrorAt(pos, missingErrSugarResults)
++	}
+ 	return append(list, newErrCheck(names, pos))
+ }
++
++// missingErrSugarResults is the error reported when the !err sugar is used in a
++// function with unnamed results.
++const missingErrSugarResults = "!err sugar requires named results (write func f() (s string, err error))"
++
++// errSugarResultsOK reports whether the implicit error check of the !err sugar
++// may return from a function with the given result list. A bare return
++// statement is valid for a function without results and for one whose results
++// are all named (including blank names).
++func errSugarResultsOK(results []*Field) bool {
++	for _, f := range results {
++		if f.Name == nil {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/src/cmd/compile/internal/syntax/parser.go b/src/cmd/compile/internal/syntax/parser.go
+--- a/src/cmd/compile/internal/syntax/parser.go
++++ b/src/cmd/compile/internal/syntax/parser.go
+@@ -33,6 +33,11 @@
+ 	fnest  int    // function nesting level (for error handling)
+ 	xnest  int    // expression nesting level (for complit ambiguity resolution)
+ 	indent []byte // tracing support
++
++	// errSugarResults is the result list of the enclosing function, or nil
++	// outside of a function body. It is used to check that the !err sugar
++	// may return from the enclosing function.
++	errSugarResults []*Field
+ }
+ 
+ func (p *parser) init(file *PosBase, r io.Reader, errh ErrorHandler, pragh PragmaHandler, mode Mode) {
+@@ -836,16 +841,19 @@
+ 	}
+ 
+ 	if p.tok == _Lbrace {
+-		f.Body = p.funcBody()
++		f.Body = p.funcBody(f.Type.ResultList)
+ 	}
+ 
+ 	return f
+ }
+ 
+-func (p *parser) funcBody() *BlockStmt {
++func (p *parser) funcBody(results []*Field) *BlockStmt {
+ 	p.fnest++
+ 	errcnt := p.errcnt
++	outerResults := p.errSugarResults
++	p.errSugarResults = results
+ 	body := p.blockStmt("")
++	p.errSugarResults = outerResults
+ 	p.fnest--
+ 
+ 	// Don't check branches if there were syntax errors in the function
+@@ -1060,7 +1068,7 @@
+ 			f := new(FuncLit)
+ 			f.pos = pos
+ 			f.Type = ftyp
+-			f.Body = p.funcBody()
++			f.Body = p.funcBody(ftyp.ResultList)
+ 
+ 			p.xnest--
+ 			return f
+diff --git a/src/go/types/errsugar.go b/src/go/types/errsugar.go
+--- a/src/go/types/errsugar.go
++++ b/src/go/types/errsugar.go
+@@ -77,6 +77,26 @@
+ 	return lhs, sugar
+ }
+ 
++// checkErrSugarResults reports an error if the enclosing function has unnamed
++// results, because the implicit error check of the !err sugar ends in a bare
++// return statement. cmd/compile reports the same error at the same position, so
++// that a program the compiler rejects is not silently accepted by tools built
++// on go/types (go vet, gopls).
++func (check *Checker) checkErrSugarResults(sugar []ast.Expr) {
++	if len(sugar) == 0 || check.sig == nil {
++		return
++	}
++	// A function without results has no result list to check.
++	if results := check.sig.Results(); results != nil {
++		for _, res := range results.vars {
++			if res.name == "" {
++				check.error(sugar[0], BadDecl, "!err sugar requires named results (write func f() (s string, err error))")
++				return
++			}
++		}
++	}
++}
++
+ // rejectErrSugar reports an error if s is an assignment using the !err sugar.
+ // It is used where the implicit error check cannot be inserted: the init and
+ // post statements of if/for/switch statements, the comm clauses of a select
+diff --git a/src/go/types/stmt.go b/src/go/types/stmt.go
+--- a/src/go/types/stmt.go
++++ b/src/go/types/stmt.go
+@@ -518,6 +518,7 @@
+ 				check.assignVars(lhs, s.Rhs)
+ 			}
+ 			check.markErrSugarUsed(sugar, s.End())
++			check.checkErrSugarResults(sugar)
+ 
+ 		default:
+ 			// assignment operations
