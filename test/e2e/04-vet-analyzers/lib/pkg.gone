@@ -1,0 +1,13 @@
+package lib
+
+import "fmt"
+
+// PrintAll 的格式串和参数不匹配, printf 分析器应当报出来。
+func PrintAll(prefix string) string {
+	return fmt.Sprintf("%d", prefix)
+}
+
+// Clean 没有问题。
+func Clean(x int) (int, error) {
+	return x + 1, nil
+}

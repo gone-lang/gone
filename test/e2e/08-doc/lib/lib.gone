@@ -1,0 +1,7 @@
+// Package lib is written in .gone files.
+package lib
+
+// Double returns twice x.
+func Double(x int) (int, error) {
+	return 2 * x, nil
+}

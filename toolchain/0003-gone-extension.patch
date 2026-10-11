@@ -1,0 +1,754 @@
+diff --git a/src/cmd/go/internal/base/path.go b/src/cmd/go/internal/base/path.go
+index a7577f6..42784bb 100644
+--- a/src/cmd/go/internal/base/path.go
++++ b/src/cmd/go/internal/base/path.go
+@@ -6,6 +6,7 @@ package base
+ 
+ import (
+ 	"errors"
++	"go/build"
+ 	"io/fs"
+ 	"os"
+ 	"path/filepath"
+@@ -75,7 +76,7 @@ func RelPaths(paths []string) []string {
+ // be excluded from coverage analysis.
+ func IsTestFile(file string) bool {
+ 	// We don't cover tests, only the code they test.
+-	return strings.HasSuffix(file, "_test.go")
++	return build.IsTestGoFile(file)
+ }
+ 
+ // IsNull reports whether the path is a common name for the null device.
+diff --git a/src/cmd/go/internal/clean/clean.go b/src/cmd/go/internal/clean/clean.go
+index c2e3775..a1f9956 100644
+--- a/src/cmd/go/internal/clean/clean.go
++++ b/src/cmd/go/internal/clean/clean.go
+@@ -9,6 +9,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"go/build"
+ 	"io"
+ 	"io/fs"
+ 	"os"
+@@ -338,7 +339,7 @@ func clean(p *load.Package) {
+ 	toRemove[p.DefaultExecName()+".test"] = true
+ 	toRemove[p.DefaultExecName()+".test.exe"] = true
+ 
+-	// Remove a potential executable, test executable for each .go file in the directory that
++	// Remove a potential executable, test executable for each Go file in the directory that
+ 	// is not part of the directory's package.
+ 	for _, dir := range dirs {
+ 		name := dir.Name()
+@@ -350,13 +351,16 @@ func clean(p *load.Package) {
+ 			continue
+ 		}
+ 
+-		if base, found := strings.CutSuffix(name, "_test.go"); found {
+-			toRemove[base+".test"] = true
+-			toRemove[base+".test.exe"] = true
+-		}
++		if build.IsGoFile(name) {
++			// ext is ".go" or ".gone".
++			ext := filepath.Ext(name)
++			if base, found := strings.CutSuffix(name, "_test"+ext); found {
++				toRemove[base+".test"] = true
++				toRemove[base+".test.exe"] = true
++			}
+ 
+-		if base, found := strings.CutSuffix(name, ".go"); found {
+-			// TODO(adg,rsc): check that this .go file is actually
++			base := strings.TrimSuffix(name, ext)
++			// TODO(adg,rsc): check that this Go file is actually
+ 			// in "package main", and therefore capable of building
+ 			// to an executable file.
+ 			toRemove[base] = true
+diff --git a/src/cmd/go/internal/doc/dirs.go b/src/cmd/go/internal/doc/dirs.go
+index 3d0bf52..9a8026f 100644
+--- a/src/cmd/go/internal/doc/dirs.go
++++ b/src/cmd/go/internal/doc/dirs.go
+@@ -7,6 +7,7 @@ package doc
+ import (
+ 	"bytes"
+ 	"fmt"
++	"go/build"
+ 	"log"
+ 	"os"
+ 	"os/exec"
+@@ -115,10 +116,10 @@ func (d *Dirs) bfsWalkRoot(root Dir) {
+ 			hasGoFiles := false
+ 			for _, entry := range entries {
+ 				name := entry.Name()
+-				// For plain files, remember if this directory contains any .go
++				// For plain files, remember if this directory contains any Go
+ 				// source files, but ignore them otherwise.
+ 				if !entry.IsDir() {
+-					if !hasGoFiles && strings.HasSuffix(name, ".go") {
++					if !hasGoFiles && build.IsGoFile(name) {
+ 						hasGoFiles = true
+ 					}
+ 					continue
+diff --git a/src/cmd/go/internal/fsys/fsys.go b/src/cmd/go/internal/fsys/fsys.go
+index 0e0821a..1de74b3 100644
+--- a/src/cmd/go/internal/fsys/fsys.go
++++ b/src/cmd/go/internal/fsys/fsys.go
+@@ -15,6 +15,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"go/build"
+ 	"internal/godebug"
+ 	"io"
+ 	"io/fs"
+@@ -599,7 +600,7 @@ func IsGoDir(name string) (bool, error) {
+ 
+ 	var firstErr error
+ 	for _, d := range fis {
+-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".go") {
++		if d.IsDir() || !build.IsGoFile(d.Name()) {
+ 			continue
+ 		}
+ 		if d.Type().IsRegular() {
+diff --git a/src/cmd/go/internal/imports/scan.go b/src/cmd/go/internal/imports/scan.go
+index 5ad438c..1093b4d 100644
+--- a/src/cmd/go/internal/imports/scan.go
++++ b/src/cmd/go/internal/imports/scan.go
+@@ -6,6 +6,7 @@ package imports
+ 
+ import (
+ 	"fmt"
++	"go/build"
+ 	"io/fs"
+ 	"path/filepath"
+ 	"sort"
+@@ -34,7 +35,7 @@ func ScanDir(path string, tags map[string]bool) ([]string, []string, error) {
+ 			dir = fs.FileInfoToDirEntry(info)
+ 		}
+ 
+-		if dir.Type().IsRegular() && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go") && MatchFile(name, tags) {
++		if dir.Type().IsRegular() && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, ".") && build.IsGoFile(name) && MatchFile(name, tags) {
+ 			files = append(files, filepath.Join(path, name))
+ 		}
+ 	}
+diff --git a/src/cmd/go/internal/load/pkg.go b/src/cmd/go/internal/load/pkg.go
+index 2985cff..7750922 100644
+--- a/src/cmd/go/internal/load/pkg.go
++++ b/src/cmd/go/internal/load/pkg.go
+@@ -1433,14 +1433,14 @@ HaveGoMod:
+ 	return path
+ }
+ 
+-// hasGoFiles reports whether dir contains any files with names ending in .go.
+-// For a vendor check we must exclude directories that contain no .go files.
++// hasGoFiles reports whether dir contains any Go source files.
++// For a vendor check we must exclude directories that contain no Go files.
+ // Otherwise it is not possible to vendor just a/b/c and still import the
+ // non-vendored a/b. See golang.org/issue/13832.
+ func hasGoFiles(dir string) bool {
+ 	files, _ := os.ReadDir(dir)
+ 	for _, f := range files {
+-		if !f.IsDir() && strings.HasSuffix(f.Name(), ".go") {
++		if !f.IsDir() && build.IsGoFile(f.Name()) {
+ 			return true
+ 		}
+ 	}
+@@ -1776,7 +1776,7 @@ func (p *Package) exeFromFiles() string {
+ 		return ""
+ 	}
+ 	_, elem := filepath.Split(src)
+-	return elem[:len(elem)-len(".go")]
++	return strings.TrimSuffix(elem, filepath.Ext(elem))
+ }
+ 
+ // DefaultExecName returns the default executable name for a package
+@@ -2942,7 +2942,7 @@ func PackagesAndErrors(ld *modload.Loader, ctx context.Context, opts PackageOpts
+ 		// Listing is only supported with all patterns referring to either:
+ 		// - Files that are part of the same directory.
+ 		// - Explicit package paths or patterns.
+-		if strings.HasSuffix(p, ".go") {
++		if build.IsGoFile(p) {
+ 			// We need to test whether the path is an actual Go file and not a
+ 			// package path or pattern ending in '.go' (see golang.org/issue/34653).
+ 			if fi, err := fsys.Stat(p); err == nil && !fi.IsDir() {
+@@ -3282,13 +3282,13 @@ func GoFilesPackage(ld *modload.Loader, ctx context.Context, opts PackageOpts, g
+ 	modload.Init(ld)
+ 
+ 	for _, f := range gofiles {
+-		if !strings.HasSuffix(f, ".go") {
++		if !build.IsGoFile(f) {
+ 			pkg := new(Package)
+ 			pkg.Internal.Local = true
+ 			pkg.Internal.CmdlineFiles = true
+ 			pkg.Name = f
+ 			pkg.Error = &PackageError{
+-				Err: fmt.Errorf("named files must be .go files: %s", pkg.Name),
++				Err: fmt.Errorf("named files must be .go or .gone files: %s", pkg.Name),
+ 			}
+ 			pkg.Incomplete = true
+ 			return pkg
+diff --git a/src/cmd/go/internal/modcmd/vendor.go b/src/cmd/go/internal/modcmd/vendor.go
+index 1dc7282..931989d 100644
+--- a/src/cmd/go/internal/modcmd/vendor.go
++++ b/src/cmd/go/internal/modcmd/vendor.go
+@@ -432,7 +432,7 @@ func matchMetadata(dir string, info fs.DirEntry) bool {
+ 
+ // matchPotentialSourceFile reports whether info may be relevant to a build operation.
+ func matchPotentialSourceFile(dir string, info fs.DirEntry, goVersion string) bool {
+-	if strings.HasSuffix(info.Name(), "_test.go") {
++	if build.IsTestGoFile(info.Name()) {
+ 		return false
+ 	}
+ 	if info.Name() == "go.mod" || info.Name() == "go.sum" {
+@@ -444,7 +444,7 @@ func matchPotentialSourceFile(dir string, info fs.DirEntry, goVersion string) bo
+ 			return false
+ 		}
+ 	}
+-	if strings.HasSuffix(info.Name(), ".go") {
++	if build.IsGoFile(info.Name()) {
+ 		f, err := fsys.Open(filepath.Join(dir, info.Name()))
+ 		if err != nil {
+ 			base.Fatal(err)
+diff --git a/src/cmd/go/internal/modget/get.go b/src/cmd/go/internal/modget/get.go
+index 682c901..90230da 100644
+--- a/src/cmd/go/internal/modget/get.go
++++ b/src/cmd/go/internal/modget/get.go
+@@ -28,6 +28,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"go/build"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+@@ -504,7 +505,7 @@ func parseArgs(ld *modload.Loader, ctx context.Context, rawArgs []string) (dropT
+ 		// Guard against 'go get x.go', a common mistake.
+ 		// Note that package and module paths may end with '.go', so only print an error
+ 		// if the argument has no version and either has no slash or refers to an existing file.
+-		if strings.HasSuffix(q.raw, ".go") && q.rawVersion == "" {
++		if build.IsGoFile(q.raw) && q.rawVersion == "" {
+ 			if !strings.Contains(q.raw, "/") {
+ 				base.Errorf("go: %s: arguments must be package or module paths", q.raw)
+ 				continue
+diff --git a/src/cmd/go/internal/modindex/build.go b/src/cmd/go/internal/modindex/build.go
+index c0acb8f..d210570 100644
+--- a/src/cmd/go/internal/modindex/build.go
++++ b/src/cmd/go/internal/modindex/build.go
+@@ -242,7 +242,7 @@ func getFileInfo(dir, name string, fset *token.FileSet) (*fileInfo, error) {
+ 	}
+ 	ext := name[i:]
+ 
+-	if ext != ".go" && fileListForExt(&dummyPkg, ext) == nil {
++	if !build.IsGoFile(name) && fileListForExt(&dummyPkg, ext) == nil {
+ 		// skip
+ 		return nil, errNonSource
+ 	}
+@@ -261,9 +261,9 @@ func getFileInfo(dir, name string, fset *token.FileSet) (*fileInfo, error) {
+ 	// TODO(matloob) should we decide whether to ignore binary only here or earlier
+ 	// when we create the index file?
+ 	var ignoreBinaryOnly bool
+-	if strings.HasSuffix(name, ".go") {
++	if build.IsGoFile(name) {
+ 		err = readGoInfo(f, info)
+-		if strings.HasSuffix(name, "_test.go") {
++		if build.IsTestGoFile(name) {
+ 			ignoreBinaryOnly = true // ignore //go:binary-only-package comments in _test.go files
+ 		}
+ 	} else {
+diff --git a/src/cmd/go/internal/modindex/read.go b/src/cmd/go/internal/modindex/read.go
+index 529c26e..31456d7 100644
+--- a/src/cmd/go/internal/modindex/read.go
++++ b/src/cmd/go/internal/modindex/read.go
+@@ -491,7 +491,7 @@ func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *b
+ 		name := tf.name()
+ 		// Check errors for go files and call badGoFiles to put them in
+ 		// InvalidGoFiles if they do have an error.
+-		if strings.HasSuffix(name, ".go") {
++		if build.IsGoFile(name) {
+ 			if error := tf.error(); error != "" {
+ 				badGoFile(name, errors.New(tf.error()))
+ 				continue
+@@ -522,7 +522,7 @@ func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *b
+ 
+ 		ext := nameExt(name)
+ 		if !shouldBuild || tf.ignoreFile() {
+-			if ext == ".go" {
++			if build.IsGoFile(name) {
+ 				p.IgnoredGoFiles = append(p.IgnoredGoFiles, name)
+ 			} else if fileListForExt(p, ext) != nil {
+ 				p.IgnoredOtherFiles = append(p.IgnoredOtherFiles, name)
+@@ -532,7 +532,7 @@ func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *b
+ 
+ 		// Going to save the file. For non-Go files, can stop here.
+ 		switch ext {
+-		case ".go":
++		case ".go", ".gone":
+ 			// keep going
+ 		case ".S", ".sx":
+ 			// special case for cgo, handled at end
+@@ -550,7 +550,7 @@ func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *b
+ 			p.IgnoredGoFiles = append(p.IgnoredGoFiles, name)
+ 			continue
+ 		}
+-		isTest := strings.HasSuffix(name, "_test.go")
++		isTest := build.IsTestGoFile(name)
+ 		isXTest := false
+ 		if isTest && strings.HasSuffix(tf.pkgName(), "_test") && p.Name != tf.pkgName() {
+ 			isXTest = true
+@@ -709,7 +709,7 @@ func (rp *IndexPackage) IsGoDir() (_ bool, err error) {
+ 		}
+ 	}()
+ 	for _, sf := range rp.sourceFiles {
+-		if strings.HasSuffix(sf.name(), ".go") {
++		if build.IsGoFile(sf.name()) {
+ 			return true, nil
+ 		}
+ 	}
+@@ -734,7 +734,7 @@ func (rp *IndexPackage) ScanDir(tags map[string]bool) (sortedImports []string, s
+ Files:
+ 	for _, sf := range rp.sourceFiles {
+ 		name := sf.name()
+-		if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".go") || !imports.MatchFile(name, tags) {
++		if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") || !build.IsGoFile(name) || !imports.MatchFile(name, tags) {
+ 			continue
+ 		}
+ 
+@@ -761,7 +761,7 @@ Files:
+ 		}
+ 		numFiles++
+ 		m := imports_
+-		if strings.HasSuffix(name, "_test.go") {
++		if build.IsTestGoFile(name) {
+ 			m = testImports
+ 		}
+ 		for _, p := range imps {
+diff --git a/src/cmd/go/internal/modindex/scan.go b/src/cmd/go/internal/modindex/scan.go
+index beded69..2134026 100644
+--- a/src/cmd/go/internal/modindex/scan.go
++++ b/src/cmd/go/internal/modindex/scan.go
+@@ -212,7 +212,6 @@ func importRaw(modroot, reldir string) *rawPackage {
+ 		}
+ 
+ 		name := d.Name()
+-		ext := nameExt(name)
+ 
+ 		if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
+ 			continue
+@@ -241,7 +240,7 @@ func importRaw(modroot, reldir string) *rawPackage {
+ 
+ 		// Going to save the file. For non-Go files, can stop here.
+ 		p.sourceFiles = append(p.sourceFiles, rf)
+-		if ext != ".go" {
++		if !build.IsGoFile(name) {
+ 			continue
+ 		}
+ 
+diff --git a/src/cmd/go/internal/modload/init.go b/src/cmd/go/internal/modload/init.go
+index 6e3f925..449e6e8 100644
+--- a/src/cmd/go/internal/modload/init.go
++++ b/src/cmd/go/internal/modload/init.go
+@@ -10,6 +10,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"go/build"
+ 	"internal/godebugs"
+ 	"internal/lazyregexp"
+ 	"io"
+@@ -1227,7 +1228,7 @@ func CreateModFile(ld *Loader, ctx context.Context, modPath string) {
+ 	// imported all the correct requirements above, we're probably missing
+ 	// some sums, so the next build command in -mod=readonly will likely fail.
+ 	//
+-	// We look for non-hidden .go files or subdirectories to determine whether
++	// We look for non-hidden Go files or subdirectories to determine whether
+ 	// this is an existing project. Walking the tree for packages would be more
+ 	// accurate, but could take much longer.
+ 	empty := true
+@@ -1237,7 +1238,7 @@ func CreateModFile(ld *Loader, ctx context.Context, modPath string) {
+ 		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+ 			continue
+ 		}
+-		if strings.HasSuffix(name, ".go") || f.IsDir() {
++		if build.IsGoFile(name) || f.IsDir() {
+ 			empty = false
+ 			break
+ 		}
+@@ -1794,7 +1795,7 @@ func findModulePath(dir string) (string, error) {
+ 	// first in top-level directory, then in subdirectories.
+ 	list, _ := os.ReadDir(dir)
+ 	for _, info := range list {
+-		if info.Type().IsRegular() && strings.HasSuffix(info.Name(), ".go") {
++		if info.Type().IsRegular() && build.IsGoFile(info.Name()) {
+ 			if com := findImportComment(filepath.Join(dir, info.Name())); com != "" {
+ 				return com, nil
+ 			}
+@@ -1804,7 +1805,7 @@ func findModulePath(dir string) (string, error) {
+ 		if info1.IsDir() {
+ 			files, _ := os.ReadDir(filepath.Join(dir, info1.Name()))
+ 			for _, info2 := range files {
+-				if info2.Type().IsRegular() && strings.HasSuffix(info2.Name(), ".go") {
++				if info2.Type().IsRegular() && build.IsGoFile(info2.Name()) {
+ 					if com := findImportComment(filepath.Join(dir, info1.Name(), info2.Name())); com != "" {
+ 						return path.Dir(com), nil
+ 					}
+diff --git a/src/cmd/go/internal/run/run.go b/src/cmd/go/internal/run/run.go
+index 1725c7d..9eaa292 100644
+--- a/src/cmd/go/internal/run/run.go
++++ b/src/cmd/go/internal/run/run.go
+@@ -98,7 +98,7 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
+ 	}()
+ 
+ 	i := 0
+-	for i < len(args) && strings.HasSuffix(args[i], ".go") {
++	for i < len(args) && build.IsGoFile(args[i]) {
+ 		i++
+ 	}
+ 	pkgOpts := load.PackageOpts{MainOnly: true}
+@@ -106,10 +106,10 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
+ 	if i > 0 {
+ 		files := args[:i]
+ 		for _, file := range files {
+-			if strings.HasSuffix(file, "_test.go") {
++			if build.IsTestGoFile(file) {
+ 				// GoFilesPackage is going to assign this to TestGoFiles.
+ 				// Reject since it won't be part of the build.
+-				base.Fatalf("go: cannot run *_test.go files (%s)", file)
++				base.Fatalf("go: cannot run *_test.go or *_test.gone files (%s)", file)
+ 			}
+ 		}
+ 		p = load.GoFilesPackage(moduleLoader, ctx, pkgOpts, files)
+@@ -166,7 +166,7 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
+ 			}
+ 			base.Fatalf("go: no suitable source files%s", hint)
+ 		}
+-		p.Internal.ExeName = src[:len(src)-len(".go")]
++		p.Internal.ExeName = strings.TrimSuffix(src, filepath.Ext(src))
+ 	} else {
+ 		p.Internal.ExeName = p.DefaultExecName()
+ 	}
+@@ -180,19 +180,19 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
+ // shouldUseOutsideModuleMode returns whether 'go run' will load packages in
+ // module-aware mode, ignoring the go.mod file in the current directory. It
+ // returns true if the first argument contains "@", does not begin with "-"
+-// (resembling a flag) or end with ".go" (a file). The argument must not be a
+-// local or absolute file path.
++// (resembling a flag) or ends with a Go source file extension (a file). The
++// argument must not be a local or absolute file path.
+ //
+ // These rules are slightly different than other commands. Whether or not
+-// 'go run' uses this mode, it interprets arguments ending with ".go" as files
+-// and uses arguments up to the last ".go" argument to comprise the package.
+-// If there are no ".go" arguments, only the first argument is interpreted
+-// as a package path, since there can be only one package.
++// 'go run' uses this mode, it interprets arguments naming Go source files as
++// files and uses arguments up to the last such argument to comprise the
++// package. If there are no Go source file arguments, only the first argument
++// is interpreted as a package path, since there can be only one package.
+ func shouldUseOutsideModuleMode(args []string) bool {
+ 	// NOTE: "@" not allowed in import paths, but it is allowed in non-canonical
+ 	// versions.
+ 	return len(args) > 0 &&
+-		!strings.HasSuffix(args[0], ".go") &&
++		!build.IsGoFile(args[0]) &&
+ 		!strings.HasPrefix(args[0], "-") &&
+ 		strings.Contains(args[0], "@") &&
+ 		!build.IsLocalImport(args[0]) &&
+diff --git a/src/cmd/go/internal/work/exec.go b/src/cmd/go/internal/work/exec.go
+index 3ed01c0..6237736 100644
+--- a/src/cmd/go/internal/work/exec.go
++++ b/src/cmd/go/internal/work/exec.go
+@@ -15,6 +15,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"go/build"
+ 	"go/token"
+ 	"internal/lazyregexp"
+ 	"io"
+@@ -106,7 +107,7 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
+ 	// Write action graph, without timing information, in case we fail and exit early.
+ 	writeActionGraph := func() {
+ 		if file := cfg.DebugActiongraph; file != "" {
+-			if strings.HasSuffix(file, ".go") {
++			if build.IsGoFile(file) {
+ 				// Do not overwrite Go source code in:
+ 				//	go build -debug-actiongraph x.go
+ 				base.Fatalf("go: refusing to write action graph to %v\n", file)
+@@ -1166,7 +1167,7 @@ func (b *Builder) loadCachedCompiledGoFiles(a *Action) error {
+ 	for name := range strings.SplitSeq(string(list), "\n") {
+ 		if name == "" { // end of list
+ 			continue
+-		} else if !strings.HasSuffix(name, ".go") {
++		} else if !build.IsGoFile(name) {
+ 			continue
+ 		}
+ 		if strings.HasPrefix(name, "./") {
+@@ -1230,11 +1231,11 @@ func analysisModuleFromModulePublic(m *modinfo.ModulePublic) *analysis.Module {
+ }
+ 
+ func buildVetConfig(a *Action, srcfiles []string, vetDeps []*Action) {
+-	// Classify files based on .go extension.
++	// Classify files based on their Go source file extension.
+ 	// srcfiles does not include raw cgo files.
+ 	var gofiles, nongofiles []string
+ 	for _, name := range srcfiles {
+-		if strings.HasSuffix(name, ".go") {
++		if build.IsGoFile(name) {
+ 			gofiles = append(gofiles, name)
+ 		} else {
+ 			nongofiles = append(nongofiles, name)
+diff --git a/src/cmd/go/internal/work/gc.go b/src/cmd/go/internal/work/gc.go
+index 49b26e1..73c6a96 100644
+--- a/src/cmd/go/internal/work/gc.go
++++ b/src/cmd/go/internal/work/gc.go
+@@ -7,6 +7,7 @@ package work
+ import (
+ 	"bufio"
+ 	"fmt"
++	"go/build"
+ 	"internal/buildcfg"
+ 	"internal/platform"
+ 	"io"
+@@ -298,7 +299,7 @@ func (a *Action) trimpath() string {
+ 				path = filepath.Join(a.Package.Dir, path)
+ 			}
+ 			base := filepath.Base(path)
+-			isGo := strings.HasSuffix(filename, ".go") || strings.HasSuffix(filename, ".s")
++			isGo := build.IsGoFile(filename) || strings.HasSuffix(filename, ".s")
+ 			isCgo := cgoFiles[filename] || !isGo
+ 			if fsys.Replaced(path) {
+ 				if isCgo {
+diff --git a/src/cmd/go/testdata/script/list_test_non_go_files.txt b/src/cmd/go/testdata/script/list_test_non_go_files.txt
+index 6b2b633..6f46a90 100644
+--- a/src/cmd/go/testdata/script/list_test_non_go_files.txt
++++ b/src/cmd/go/testdata/script/list_test_non_go_files.txt
+@@ -2,10 +2,10 @@ env GO111MODULE=off
+ 
+ # issue 29899: handling files with non-Go extension
+ go list -e -test -json -- c.c x.go
+-stdout '"Err": "named files must be .go files: c.c"'
++stdout '"Err": "named files must be .go or .gone files: c.c"'
+ 
+ ! go list -test -json -- c.c x.go
+-stderr '^named files must be \.go files: c\.c$'
++stderr '^named files must be \.go or \.gone files: c\.c$'
+ 
+ -- x.go --
+ package main
+diff --git a/src/cmd/gofmt/gofmt.go b/src/cmd/gofmt/gofmt.go
+index 3178b05..4b15486 100644
+--- a/src/cmd/gofmt/gofmt.go
++++ b/src/cmd/gofmt/gofmt.go
+@@ -10,6 +10,7 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"go/ast"
++	"go/build"
+ 	"go/parser"
+ 	"go/printer"
+ 	"go/scanner"
+@@ -91,7 +92,7 @@ func initParserMode() {
+ }
+ 
+ func isGoFilename(name string) bool {
+-	return !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
++	return !strings.HasPrefix(name, ".") && build.IsGoFile(name)
+ }
+ 
+ // A sequencer performs concurrent tasks that may write output, but emits that
+diff --git a/src/go/build/build.go b/src/go/build/build.go
+index 4c6be41..d3826fd 100644
+--- a/src/go/build/build.go
++++ b/src/go/build/build.go
+@@ -452,7 +452,7 @@ type Package struct {
+ 	BinaryOnly    bool     // cannot be rebuilt from source (has //go:binary-only-package comment)
+ 
+ 	// Source files
+-	GoFiles           []string // .go source files (excluding CgoFiles, TestGoFiles, XTestGoFiles)
++	GoFiles           []string // .go/.gone source files (excluding CgoFiles, TestGoFiles, XTestGoFiles)
+ 	CgoFiles          []string // .go source files that import "C"
+ 	IgnoredGoFiles    []string // .go source files ignored for this build (including ignored _test.go files)
+ 	InvalidGoFiles    []string // .go source files with detected problems (parse error, wrong package name, and so on)
+@@ -556,6 +556,32 @@ func nameExt(name string) string {
+ 	return name[i:]
+ }
+ 
++// goFileExts lists the name extensions that are treated as Go source files.
++// The gone toolchain adds ".gone" to the standard ".go", so that a package may
++// be written in .gone files and built directly by the go command.
++var goFileExts = []string{".go", ".gone"}
++
++// IsGoFile and IsTestGoFile are the single source of truth for which names the
++// gone toolchain treats as Go source files; callers outside go/build (cmd/go,
++// cmd/gofmt) should use them rather than testing suffixes themselves.
++
++// IsGoFile reports whether name is the name of a Go source file, that is,
++// whether it has one of the extensions listed in goFileExts.
++func IsGoFile(name string) bool {
++	for _, ext := range goFileExts {
++		if strings.HasSuffix(name, ext) {
++			return true
++		}
++	}
++	return false
++}
++
++// IsTestGoFile reports whether name is the name of a Go test source file,
++// e.g. "x_test.go" or (in the gone toolchain) "x_test.gone".
++func IsTestGoFile(name string) bool {
++	return strings.HasSuffix(name, "_test.go") || strings.HasSuffix(name, "_test.gone")
++}
++
+ var installgoroot = godebug.New("installgoroot")
+ 
+ // Import returns details about the Go package named by the import path,
+@@ -898,14 +924,14 @@ Found:
+ 		ext := nameExt(name)
+ 
+ 		info, err := ctxt.matchFile(p.Dir, name, allTags, &p.BinaryOnly, fset)
+-		if err != nil && strings.HasSuffix(name, ".go") {
++		if err != nil && IsGoFile(name) {
+ 			badGoFile(name, err)
+ 			continue
+ 		}
+ 		if info == nil {
+ 			if strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
+ 				// not due to build constraints - don't report
+-			} else if ext == ".go" {
++			} else if IsGoFile(name) {
+ 				p.IgnoredGoFiles = append(p.IgnoredGoFiles, name)
+ 			} else if fileListForExt(p, ext) != nil {
+ 				p.IgnoredOtherFiles = append(p.IgnoredOtherFiles, name)
+@@ -915,7 +941,7 @@ Found:
+ 
+ 		// Going to save the file. For non-Go files, can stop here.
+ 		switch ext {
+-		case ".go":
++		case ".go", ".gone":
+ 			// keep going
+ 		case ".S", ".sx":
+ 			// special case for cgo, handled at end
+@@ -945,7 +971,7 @@ Found:
+ 			}
+ 		}
+ 
+-		isTest := strings.HasSuffix(name, "_test.go")
++		isTest := IsTestGoFile(name)
+ 		isXTest := false
+ 		if isTest && strings.HasSuffix(pkg, "_test") && p.Name != pkg {
+ 			isXTest = true
+@@ -1286,7 +1312,7 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode)
+ func hasGoFiles(ctxt *Context, dir string) bool {
+ 	ents, _ := ctxt.readDir(dir)
+ 	for _, ent := range ents {
+-		if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".go") {
++		if !ent.IsDir() && IsGoFile(ent.Name()) {
+ 			return true
+ 		}
+ 	}
+@@ -1459,7 +1485,7 @@ func (ctxt *Context) matchFile(dir, name string, allTags map[string]bool, binary
+ 	}
+ 	ext := name[i:]
+ 
+-	if ext != ".go" && fileListForExt(&dummyPkg, ext) == nil {
++	if !IsGoFile(name) && fileListForExt(&dummyPkg, ext) == nil {
+ 		// skip
+ 		return nil, nil
+ 	}
+@@ -1479,9 +1505,9 @@ func (ctxt *Context) matchFile(dir, name string, allTags map[string]bool, binary
+ 		return nil, err
+ 	}
+ 
+-	if strings.HasSuffix(name, ".go") {
++	if IsGoFile(name) {
+ 		err = readGoInfo(f, info)
+-		if strings.HasSuffix(name, "_test.go") {
++		if IsTestGoFile(name) {
+ 			binaryOnly = nil // ignore //go:binary-only-package comments in _test.go files
+ 		}
+ 	} else {
+diff --git a/src/go/doc/doc.go b/src/go/doc/doc.go
+index 8c78689..3a1a41b 100644
+--- a/src/go/doc/doc.go
++++ b/src/go/doc/doc.go
+@@ -272,7 +272,7 @@ func NewFromFiles(fset *token.FileSet, files []*ast.File, importPath string, opt
+ 		panic(fmt.Errorf("doc.NewFromFiles: there must not be more than 1 option argument"))
+ 	}
+ 
+-	// Collect .go and _test.go files.
++	// Collect Go source files and test Go source files.
+ 	var (
+ 		pkgName     string
+ 		goFiles     = make(map[string]*ast.File)
+@@ -284,13 +284,13 @@ func NewFromFiles(fset *token.FileSet, files []*ast.File, importPath string, opt
+ 			return nil, fmt.Errorf("file files[%d] is not found in the provided file set", i)
+ 		}
+ 		switch filename := f.Name(); {
+-		case strings.HasSuffix(filename, "_test.go"):
++		case strings.HasSuffix(filename, "_test.go") || strings.HasSuffix(filename, "_test.gone"):
+ 			testGoFiles = append(testGoFiles, file)
+-		case strings.HasSuffix(filename, ".go"):
++		case strings.HasSuffix(filename, ".go") || strings.HasSuffix(filename, ".gone"):
+ 			pkgName = file.Name.Name
+ 			goFiles[filename] = file
+ 		default:
+-			return nil, fmt.Errorf("file files[%d] filename %q does not have a .go extension", i, filename)
++			return nil, fmt.Errorf("file files[%d] filename %q does not have a Go source file extension", i, filename)
+ 		}
+ 	}
+ 
+diff --git a/src/go/doc/headscan.go b/src/go/doc/headscan.go
+index 82f5fed..f2e1796 100644
+--- a/src/go/doc/headscan.go
++++ b/src/go/doc/headscan.go
+@@ -40,8 +40,11 @@ var html_h = regexp.MustCompile(`<h3 id="[^"]*">`)
+ const html_endh = "</h3>\n"
+ 
+ func isGoFile(fi fs.FileInfo) bool {
+-	return strings.HasSuffix(fi.Name(), ".go") &&
+-		!strings.HasSuffix(fi.Name(), "_test.go")
++	name := fi.Name()
++	// See go/build.IsGoFile: the gone toolchain also accepts ".gone".
++	isGo := strings.HasSuffix(name, ".go") || strings.HasSuffix(name, ".gone")
++	isTest := strings.HasSuffix(name, "_test.go") || strings.HasSuffix(name, "_test.gone")
++	return isGo && !isTest
+ }
+ 
+ func appendHeadings(list []string, comment string) []string {
+diff --git a/src/go/parser/interface.go b/src/go/parser/interface.go
+index ec9cb46..454b982 100644
+--- a/src/go/parser/interface.go
++++ b/src/go/parser/interface.go
+@@ -133,12 +133,20 @@ func ParseFile(fset *token.FileSet, filename string, src any, mode Mode) (f *ast
+ 	return
+ }
+ 
+-// ParseDir calls [ParseFile] for all files with names ending in ".go" in the
+-// directory specified by path and returns a map of package name -> package
+-// AST with all the packages found.
++// isGoFile reports whether name is the name of a Go source file. It mirrors
++// go/build.IsGoFile, which also accepts ".gone" in the gone toolchain; go/parser
++// cannot import go/build, because go/build imports go/parser.
++func isGoFile(name string) bool {
++	return strings.HasSuffix(name, ".go") || strings.HasSuffix(name, ".gone")
++}
++
++// ParseDir calls [ParseFile] for all files with names ending in ".go" (or, in
++// the gone toolchain, ".gone") in the directory specified by path and returns
++// a map of package name -> package AST with all the packages found.
+ //
+ // If filter != nil, only the files with [fs.FileInfo] entries passing through
+-// the filter (and ending in ".go") are considered. The mode bits are passed
++// the filter (and ending in a Go source file extension) are considered. The
++// mode bits are passed
+ // to [ParseFile] unchanged. Position information is recorded in fset, which
+ // must not be nil.
+ //
+@@ -158,7 +166,7 @@ func ParseDir(fset *token.FileSet, path string, filter func(fs.FileInfo) bool, m
+ 
+ 	pkgs = make(map[string]*ast.Package)
+ 	for _, d := range list {
+-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".go") {
++		if d.IsDir() || !isGoFile(d.Name()) {
+ 			continue
+ 		}
+ 		if filter != nil {

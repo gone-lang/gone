@@ -1,0 +1,16 @@
+package lib
+
+import "testing"
+
+func TestDouble(t *testing.T) {
+	got, !err := Double(21)
+	if got != 42 {
+		t.Fatalf("Double(21) = %d", got)
+	}
+}
+
+func TestBad(t *testing.T) {
+	if triple(2) != 7 {
+		t.Fatal("triple(2) != 7")
+	}
+}

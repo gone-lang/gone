@@ -1,0 +1,3 @@
+set -e
+"$GO" build ./...
+"$GO" run .

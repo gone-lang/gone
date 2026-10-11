@@ -1,0 +1,3 @@
+linux
+GoFiles: impl_linux.gone main.gone
+IgnoredGoFiles: ignored.gone impl_windows.gone

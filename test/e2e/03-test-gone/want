@@ -1,0 +1,6 @@
+--- PASS: TestDouble (X)
+PASS
+--- FAIL: TestBad (X)
+FAIL
+FAIL
+rc=1

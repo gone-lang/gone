@@ -11,8 +11,10 @@
 # 两种模式:
 #   默认     下载官方 go<VERSION>.src.tar.gz(校验 sha256), 打上 toolchain/*.patch,
 #            再用 make.bash 完整自举(约 1~2 分钟)
-#   --fast   复制本机已装 Go 的 GOROOT, 打上补丁后只重建 cmd/compile(约 20 秒)
-#            适合开发迭代; 产物里除 compile 之外都是本机原版工具
+#   --fast   复制本机已装 Go 的 GOROOT, 打上补丁后只重建受影响的
+#            cmd/compile、cmd/vet、cmd/go、cmd/gofmt(约 30 秒)
+#            适合开发迭代; 注意产物基于本机 GOROOT 的版本, 不一定是 toolchain/VERSION
+#            锁定的版本, 正式验证请用完整模式
 #
 set -euo pipefail
 
@@ -37,7 +39,7 @@ usage() {
 用法: $(basename "$0") [选项]
 
 选项:
-  --fast              快速模式: 复制本机 GOROOT, 只重建 cmd/compile
+  --fast              快速模式: 复制本机 GOROOT, 只重建受影响的那几个命令
   --out DIR           产物 GOROOT 目录 (默认: $repo_root/gone-go)
   --cache DIR         下载缓存目录 (默认: $repo_root/.cache)
   --src DIR           使用已有的 Go 源码目录, 跳过下载
@@ -172,13 +174,22 @@ build_fast() {
 	echo ">> 源码版本: $(cat "$out/VERSION")"
 	apply_patches "$out"
 
-	# 补丁改到哪个包, 就要重建哪些预编译工具, 否则 go 命令用的还是旧二进制:
-	#   compile  <- cmd/compile/internal/syntax (M1: !err 脱糖)
-	#   vet      <- go/types                   (M3: go/types 认识 !err)
+	# 补丁改到哪个包, 就要重建哪些预编译工具/命令, 否则 go 命令用的还是旧二进制:
+	#   compile   <- cmd/compile/internal/syntax (M1: !err 脱糖)
+	#   vet       <- go/types                   (M3: go/types 认识 !err)
+	#   go, gofmt <- go/build, go/parser, go/doc, cmd/go, cmd/gofmt (M2: .gone 扩展名)
 	local tool
 	for tool in compile vet; do
 		echo ">> 重建 cmd/$tool -> pkg/tool/${goos}_${goarch}/$tool"
 		(cd "$out/src" && GOROOT="$out" "$out/bin/go" build -o "$out/pkg/tool/${goos}_${goarch}/$tool" "./cmd/$tool")
+	done
+
+	local cmd
+	for cmd in go gofmt; do
+		echo ">> 重建 cmd/$cmd -> bin/$cmd"
+		# 不能直接覆盖正在运行的 bin/go(ETXTBSY), 先写到中间文件再 mv
+		(cd "$out/src" && GOROOT="$out" "$out/bin/go" build -o "$out/bin/$cmd.new" "./cmd/$cmd")
+		mv -f "$out/bin/$cmd.new" "$out/bin/$cmd"
 	done
 }
 

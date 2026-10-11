@@ -1,1 +1,1 @@
-main.go:9:14: fmt.Printf format %d reads arg #1, but call has 0 args
+main.gone:9:14: fmt.Printf format %d reads arg #1, but call has 0 args

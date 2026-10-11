@@ -1,0 +1,16 @@
+gofmt -l:
+a.gone
+go fmt:
+a.gone
+gofmt -l (再来一次):
+格式化结果:
+package main
+
+import "fmt"
+
+func main() {
+	v, !err := f()
+	fmt.Println(v)
+}
+
+func f() (int, error) { return 1, nil }

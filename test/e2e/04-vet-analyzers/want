@@ -1,0 +1,2 @@
+pkg.gone:7:22: fmt.Sprintf format %d has arg prefix of wrong type string
+vet rc=1

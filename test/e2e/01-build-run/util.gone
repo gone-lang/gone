@@ -1,0 +1,7 @@
+package main
+
+import "fmt"
+
+func greeting(who string) (string, error) {
+	return fmt.Sprintf("hello %s", who), nil
+}

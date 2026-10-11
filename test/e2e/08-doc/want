@@ -1,0 +1,5 @@
+package lib // import "gonetest/lib"
+
+Package lib is written in .gone files.
+
+func Double(x int) (int, error)

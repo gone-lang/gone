@@ -226,6 +226,61 @@ $ go build -gcflags=-S .
 `. "internal/types/errors"` 点导入；`check.errorf` 按 `TestErrorCalls` 的要求
 至少要带一个格式参数，所以这里用 `check.error`。
 
+### 3.6 补丁点 3：`.gone` 扩展名（`go` 命令侧）
+
+M1 之后编译器已经认识语法糖了，但 `go build` 还不认识 `.gone` 扩展名：
+`go build .` 会报 `no Go files`，`go list` 会报 `no Go files`，
+连 `go vet`/`go doc`/`gofmt` 也看不到这些文件。M2 就是把「哪些文件名算 Go 源码」
+这件事在工具链里补齐。
+
+做法是**收敛到唯一真源**：`go/build` 里的扩展名表 + 两个判断函数，
+其余地方一律调它，而不再自己写 `strings.HasSuffix(name, ".go")`：
+
+```go
+// src/go/build/build.go
+var goFileExts = []string{".go", ".gone"}
+
+func IsGoFile(name string) bool
+func IsTestGoFile(name string) bool
+```
+
+| 位置 | 改动 |
+|---|---|
+| `src/go/build/build.go` | 扩展名表 + `IsGoFile`/`IsTestGoFile`；`ImportDir`/`importGo` 等 7 处调用点 |
+| `src/cmd/go/internal/modindex/{build,read,scan}.go` | 模块索引（`go list` 的快速路径，是 `go/build` 逻辑的复制品） |
+| `src/cmd/go/internal/fsys/fsys.go` | `IsGoDir`：这个目录里有没有 Go 文件 |
+| `src/cmd/go/internal/imports/scan.go` | `ScanDir`：扫目录时收集哪些文件 |
+| `src/cmd/go/internal/load/pkg.go` | 目录扫描、命令行文件参数、报错文本、可执行名推导 |
+| `src/cmd/go/internal/run/run.go` | `go run a.gone` 的文件参数识别、`ExeName` 去扩展名 |
+| `src/cmd/go/internal/work/{exec,gc}.go` | vet 配置里 `GoFiles`/`NonGoFiles` 的划分、overlay 重写 |
+| `src/cmd/go/internal/{clean,doc,modget,modload,modcmd,base}` | `go clean` 推导要删的可执行名、`go doc` 目录扫描、`go get` 文件名提示、模块扫描、`go mod vendor` 过滤、`IsTestFile` |
+| `src/go/parser/interface.go` | `ParseDir`（`go doc` 依赖它）。go/parser 不能 import go/build（go/build import 了 go/parser），所以本地复制一份 `isGoFile` |
+| `src/go/doc/{doc,headscan}.go` | `NewFromFiles` 的文件分类 |
+| `src/cmd/gofmt/gofmt.go` | `gofmt -l/-w`、`go fmt` 的目录遍历 |
+
+踩到的坑：
+
+1. **`go list` 会绕开 `go/build`。** 修好 `go/build` 之后 `ImportDir` 已经能返回
+   `GoFiles=[main.gone]`，但 `go list` 还是报
+   `package m2 is not in std (/…/src/m2)` —— 因为 `modload.dirInModule` 判断
+   「这个目录里到底有没有 Go 文件」时走的是 `modindex.GetPackage(...).IsGoDir()`
+   或 `fsys.IsGoDir()`，而这两个都是只看 `.go` 后缀的独立实现。
+   把 modindex（模块索引）和 fsys 一起改掉之后，`go build/run/list/vet/test` 才全部通。
+   —— 这也是为什么这轮补丁落点看着多：同一句后缀判断在 cmd/go 里有好几份副本。
+2. **构建约束与 `GOOS`/`GOARCH` 后缀天然可用。** `matchFile`/`goodOSArchFile`
+   都是先 `strings.Cut(name, ".")` 去掉扩展名再判断，与扩展名长度无关，
+   所以 `impl_linux.gone`、`//go:build windows`、`//go:build ignore` 的行为和 `.go` 完全一致
+   （`test/e2e/05-build-tags` 覆盖）。
+
+语义约定：
+
+- `.gone` 与 `.go` **同等对待**，同一个包里两种扩展名混用会一起编译（按文件名字母序），
+  不搞"同名优先"之类的魔法。
+- 于是 `example/` 目录里同时放 `main.go` 与 `main.gone` 会重复声明 —— 给 `main.gone`
+  加 `//go:build ignore` 解决（`go run main.gone` 走命令行文件模式，不看构建约束），
+  这样 `go build ./...` 和 `go run example/main.gone` 都能用。
+
+
 ## 4. 限制
 
 1. **裸 `return` 要求函数结果全为具名，或函数没有结果。**
@@ -241,10 +296,12 @@ $ go build -gcflags=-S .
    解决办法：写成 `func f() (s string, err error)`。
    要做到「自动 `return zero..., err`」需要类型信息，属后续里程碑（见 M4）。
 
-2. **`.gone` 扩展名暂时还要靠改名。**
-   本轮只改了编译器；`go build` 侧的扩展名识别属 M2，所以现在
-   `.gone` 文件需要改名成 `.go` 才能被 `go build` 处理
-   （`go tool compile some.gone` 已经可以，编译器本身不看扩展名）。
+2. **`.gone` 只在 gone 工具链里被识别。**
+   用 gone 工具链的 `go build` / `go run` / `go test` / `go vet` / `go doc` / `gofmt`
+   都能直接吃 `.gone`（含 `_test.gone`）；但换成官方工具链就得改名成 `.go`，
+   第三方工具（编辑器、`gopls`、各种 lint）也各有各的目录扫描逻辑，未必认这个扩展名。
+   另外 `internal/goroot`（回答"这是不是标准库包"）仍然只看 `.go`，
+   把标准库本身改写成 `.gone` 不在支持范围。
 
 3. **gopls 需要用 gone 工具链重装一份。** `go vet` 已经随工具链准备好了，
    但 gopls 是外部二进制、把 `go/types` 静态链接进去，
@@ -256,13 +313,13 @@ $ go build -gcflags=-S .
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | **M1** | `cmd/compile/internal/syntax` 解析器脱糖 `!err`，重建工具链并验证 | ✅ 已完成 |
-| M2 | `go/build` + `go list`/模块扫描识别 `.gone` 扩展名，`go build ./...` 直接吃 `.gone` | 待定 |
-| M3 | `go/types` 支持，让 `go vet` / gopls 认识 `!err`（`go/parser`、`gofmt` 本来就无需改动） | ✅ 已完成 |
+| **M2** | 工具链识别 `.gone` 扩展名（`go/build`、模块索引、`go` 命令、`go/parser.ParseDir`、`go/doc`、`gofmt`），`go build ./...` 直接吃 `.gone` | ✅ 已完成 |
+| **M3** | `go/types` 支持，让 `go vet` / gopls 认识 `!err` | ✅ 已完成 |
 | M4 | 结果未具名时自动 `return zero..., err`（需要类型信息，在 noder/types 层补）；错误信息打磨 | 待定 |
 | M5 | 更多语法糖变体（如 `!panic`、`!continue`）——需要先讨论语法，避免歧义 | 待讨论 |
 
-> M2 落地时要注意 `example/` 目录同时放着 `main.go` 和 `main.gone`
-> （一个是手工展开的等价代码），扩展名一旦被识别就会出现重复声明，需要一起调整。
+M1/M3 只管语法糖本身，`.gone` 扩展名由 M2 补齐；两者互不依赖
+（只改编译器、不认 `.gone` 时，把文件改名成 `.go` 也能用）。
 
 ## 6. 工具链构建与测试
 
@@ -270,7 +327,7 @@ $ go build -gcflags=-S .
 # 完整构建：下载官方 go1.27.2 源码(校验 sha256) → 打补丁 → make.bash 自举
 scripts/build-toolchain.sh
 
-# 快速迭代：复制本机 GOROOT → 打补丁 → 只重建 cmd/compile 与 cmd/vet（约 3 秒）
+# 快速迭代：复制本机 GOROOT → 打补丁 → 只重建 cmd/compile、cmd/vet、cmd/go、cmd/gofmt（约 30 秒）
 scripts/build-toolchain.sh --fast --out ./gone-go --force
 
 # 用产物跑测试套件
@@ -282,11 +339,20 @@ export PATH="$GOROOT/bin:$PATH"
 go build ./...
 ```
 
+一个小坑：如果像本文档这样把工具链建在仓库内部（`./gone-go`），
+仓库根的 `go.mod` 会罩住 `gone-go/src`，于是从那里跑
+`go test go/types` 之类的标准库测试会报
+`can't find import: "fmt": main module (…)`；
+`go build ./...` 也会顺手扫进整个 `gone-go/src`。
+把工具链建到仓库外（`--out /tmp/gone-go`）或者直接指定包路径即可绕开。
+
 固件版本记录在 `toolchain/VERSION`。补丁是针对该版本源码生成的；
 升级 Go 版本后必须重新验证补丁能否干净应用（用 `patch --dry-run` 或直接跑测试套件）。
 
-注意：补丁改到哪个包，就必须重建哪些**预编译工具**，否则 `go` 命令用的还是旧二进制 ——
-`--fast` 模式因此会重建 `compile`（对应 §3.2）和 `vet`（对应 §3.5）。
+注意：补丁改到哪个包，就必须重建哪些**预编译工具/命令**，否则 `go` 命令用的还是旧二进制 ——
+`--fast` 模式因此会重建 `compile`（对应 §3.2）、`vet`（对应 §3.5）、
+`go` 与 `gofmt`（对应 §3.6；`cmd/go` 静态链接了 `go/build`、`go/parser`、`go/doc`）。
+重建 `bin/go` 时要先写中间文件再 `mv`，否则覆盖正在运行的可执行文件会 `ETXTBSY`。
 
 测试套件：
 
@@ -295,24 +361,38 @@ go build ./...
 - `test/reject/*/` —— 非法位置用例，比对编译报错文本**含行列号**（确保 `!` 被精确指向）。
 - `test/vet/*/` —— `go vet`（走 `go/types`）用例：合法糖必须干净通过、
   真 bug 仍要报出来、非法位置要报出 `go/types` 的错误。
+- `test/e2e/*/` —— `.gone` 端到端用例（`run.sh` + `want`）：多文件包、命令行文件参数、
+  `go test`（含故意失败的用例）、`go vet` 分析器、构建约束/`GOOS` 后缀、`gofmt`/`go fmt`、
+  `go clean`、`go doc`。
 - `test/tools/gotypescheck/` —— 直接用 `go/parser` + `go/types` 类型检查一段固定源码，
   比对诊断列表（覆盖「声明但未使用」这类需要 `Info` 完整性的场景）。
 
 ## 7. 已验证内容
 
-- `scripts/test.sh`：15/15 通过，覆盖 4 个套件（`--fast` 与完整自举两套工具链）。
-- 回归：`go test cmd/compile/internal/syntax cmd/compile/internal/types2 cmd/compile/internal/noder` 全绿。
+- `scripts/test.sh`：24/24 通过，覆盖 5 个套件（`--fast` 与完整自举两套工具链）。
+  M2 的 `test/e2e/*` 覆盖：多文件包、命令行文件参数、`_test.gone`（含故意失败的用例）、
+  `go vet` 分析器、构建约束与 `GOOS` 后缀、`gofmt`/`go fmt`、`go clean`、`go doc`。
+- M2 补丁（`toolchain/0003-*.patch`）在官方 `go1.27.2.src.tar.gz` 上从头 `patch -p1 -N --fuzz=3`，
+  产物与开发分支逐字节一致；`make.bash` 完整自举通过。
+- M2 回归：`go test go/build go/parser go/doc cmd/gofmt`，以及 `go build -a std`。
+- M1 回归：`go test cmd/compile/internal/syntax cmd/compile/internal/types2 cmd/compile/internal/noder` 全绿。
 - 全量：`make.bash` 用改后的编译器等自举了三轮，并编译了整个标准库与全部命令。
 - 自举：用打了补丁的编译器编译 `cmd/compile` 自己，产出的编译器再跑测试套件仍然全绿。
 - 行号：`-gcflags=-S` 确认 nil 检查的代码归属行 == `!err` 所在行。
 - M3 端到端：`go vet` 在语法糖代码上不再 panic 且仍能查出 printf 问题；
   用 gone 工具链重装的 gopls 对合法糖零诊断、对非法位置报出与编译器同位置的错误。
 - M3 幂等性：同一份 AST 连续类型检查 3 次结果一致（gopls 会重复检查，这点专门验证过）。
+- M2+M3 端到端（编辑器侧）：用 gone 工具链重新安装的 `gopls v0.23.0`
+  对 `.gone` 与 `.go` 里的合法糖都是零诊断，`gopls check main.gone` 能直接类型检查 `.gone`；
+  用 M3 修复前的工具链构建的旧 gopls 会报 `declared and not used: err`，
+  所以升级工具链后必须重装 gopls。
 
 ## 8. 风险
 
 - **补丁跟随上游**：Go 每个版本 `cmd/compile/internal/syntax` 与 `go/types` 都可能微调，
   升级时需要重新 rebase 补丁（补丁都很小，成本可控）。
+- **扩展名判断点在 cmd/go 里有多份副本**：`modindex` 与 `fsys` 各自有一份"目录里有没有 Go 文件"
+  的实现，上游新增类似判断点时补丁需要跟着补（本轮已把能收敛的都收敛到 `go/build.IsGoFile`）。
 - **`Info` 完整性是 M3 的隐性契约**：因为不改写 AST（为了可重复检查），
   `!err` 这个表达式节点会留在 AST 里，必须靠我们补的 `Uses` / `Types` 条目
   让遍历 AST 的工具满意。目前已知 `go vet`（`satisfy`）与 gopls 依赖这一点；
